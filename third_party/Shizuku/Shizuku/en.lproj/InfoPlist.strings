@@ -1,0 +1,12 @@
+/* 
+  InfoPlist.strings
+  Shizuku
+
+  Created by miwa on 2024/03/20.
+  
+*/
+
+CFBundleName = "Shizuku";
+
+com.apple.inputmethod.Roman = "Shizuku (English)";
+com.apple.inputmethod.Japanese = "Shizuku (日本語)";

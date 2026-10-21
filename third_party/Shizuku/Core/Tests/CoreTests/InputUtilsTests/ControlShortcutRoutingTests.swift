@@ -1,0 +1,389 @@
+import Core
+import Testing
+
+private func makeControlEvent(
+    logicalKey: String?,
+    characters: String?,
+    modifiers: KeyEventCore.ModifierFlag,
+    keyCode: UInt16
+) -> KeyEventCore {
+    KeyEventCore(
+        modifierFlags: modifiers,
+        characters: characters,
+        charactersIgnoringModifiers: logicalKey,
+        keyCode: keyCode
+    )
+}
+
+@Test func testUnhandledControlShortcutsAreNotConvertedToInput() {
+    let controlBackquote = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: "`",
+            characters: "`",
+            modifiers: [.control],
+            keyCode: 50
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .unknown = controlBackquote else {
+        Issue.record("Expected Ctrl+` to be unknown, got \(controlBackquote)")
+        return
+    }
+
+    let controlShiftO = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: "o",
+            characters: "O",
+            modifiers: [.control, .shift],
+            keyCode: 31
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .unknown = controlShiftO else {
+        Issue.record("Expected Ctrl+Shift+O to be unknown, got \(controlShiftO)")
+        return
+    }
+
+    let numberKeyCodes: [(logicalKey: String, keyCode: UInt16)] = [
+        ("1", 18),
+        ("2", 19),
+        ("3", 20),
+        ("4", 21),
+        ("5", 23),
+        ("6", 22),
+        ("7", 26),
+        ("8", 28),
+        ("9", 25),
+        ("0", 29)
+    ]
+    for (logicalKey, keyCode) in numberKeyCodes {
+        let controlNumber = UserAction.getUserAction(
+            eventCore: makeControlEvent(
+                logicalKey: logicalKey,
+                characters: logicalKey,
+                modifiers: [.control],
+                keyCode: keyCode
+            ),
+            inputLanguage: .japanese
+        )
+        guard case .unknown = controlNumber else {
+            Issue.record("Expected Ctrl+\(logicalKey) to be unknown, got \(controlNumber)")
+            return
+        }
+    }
+
+    let controlSpace = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: " ",
+            characters: " ",
+            modifiers: [.control],
+            keyCode: 49
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .unknown = controlSpace else {
+        Issue.record("Expected Ctrl+Space to be unknown, got \(controlSpace)")
+        return
+    }
+
+    let controlLeft = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: nil,
+            characters: nil,
+            modifiers: [.control],
+            keyCode: 123
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .unknown = controlLeft else {
+        Issue.record("Expected Ctrl+Left to be unknown, got \(controlLeft)")
+        return
+    }
+}
+
+@Test func testKnownControlShortcutsKeepTheirActions() {
+    let controlDelete = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: nil,
+            characters: nil,
+            modifiers: [.control],
+            keyCode: 51
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .forget = controlDelete else {
+        Issue.record("Expected Ctrl+Delete to be forget, got \(controlDelete)")
+        return
+    }
+
+    let controlH = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: "h",
+            characters: "\u{08}",
+            modifiers: [.control],
+            keyCode: 4
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .backspace = controlH else {
+        Issue.record("Expected Ctrl+H to be backspace, got \(controlH)")
+        return
+    }
+
+    let controlJ = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: "j",
+            characters: "\n",
+            modifiers: [.control],
+            keyCode: 38
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .function(.six) = controlJ else {
+        Issue.record("Expected Ctrl+J to be function(.six), got \(controlJ)")
+        return
+    }
+
+    let controlSemicolon = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: ";",
+            characters: ";",
+            modifiers: [.control],
+            keyCode: 41
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .function(.eight) = controlSemicolon else {
+        Issue.record("Expected Ctrl+; to be function(.eight), got \(controlSemicolon)")
+        return
+    }
+
+    let controlShiftU = UserAction.getUserAction(
+        eventCore: makeControlEvent(
+            logicalKey: "u",
+            characters: "U",
+            modifiers: [.control, .shift],
+            keyCode: 32
+        ),
+        inputLanguage: .japanese
+    )
+    guard case .startUnicodeInput = controlShiftU else {
+        Issue.record("Expected Ctrl+Shift+U to be startUnicodeInput, got \(controlShiftU)")
+        return
+    }
+}
+
+@Test func testUnknownActionsFallThroughToHostApplication() {
+    let controlBackquoteEvent = makeControlEvent(
+        logicalKey: "`",
+        characters: "`",
+        modifiers: [.control],
+        keyCode: 50
+    )
+
+    let (noneAction, noneCallback) = InputState.none.event(
+        eventCore: controlBackquoteEvent,
+        userAction: .unknown,
+        inputLanguage: .japanese,
+        liveConversionEnabled: false,
+        enableDebugWindow: false,
+        enableSuggestion: false
+    )
+    guard case .fallthrough = noneAction, case .fallthrough = noneCallback else {
+        Issue.record("Expected unknown action in none state to fall through, got \(noneAction), \(noneCallback)")
+        return
+    }
+
+    let (composingAction, composingCallback) = InputState.composing.event(
+        eventCore: controlBackquoteEvent,
+        userAction: .unknown,
+        inputLanguage: .japanese,
+        liveConversionEnabled: false,
+        enableDebugWindow: false,
+        enableSuggestion: false
+    )
+    // Ctrl修飾付きの.unknownはcomposing中にmarked textを保護するためconsumeに変更されている
+    guard case .consume = composingAction, case .fallthrough = composingCallback else {
+        Issue.record("Expected unknown action with Ctrl in composing state to be consumed, got \(composingAction), \(composingCallback)")
+        return
+    }
+}
+
+@Test func testCtrlUnknownIsConsumedDuringComposingStates() {
+    // Ctrl+Shift+O などの未定義 Ctrl 系キーはcomposing系状態でconsumeされ、marked textの消失を防ぐ
+    let controlShiftOEvent = makeControlEvent(
+        logicalKey: "o",
+        characters: "O",
+        modifiers: [.control, .shift],
+        keyCode: 31
+    )
+    let controlBackquoteEvent = makeControlEvent(
+        logicalKey: "`",
+        characters: "`",
+        modifiers: [.control],
+        keyCode: 50
+    )
+
+    let composingStates: [InputState] = [.composing, .previewing, .selecting, .replaceSuggestion]
+    for state in composingStates {
+        for event in [controlShiftOEvent, controlBackquoteEvent] {
+            let (action, callback) = state.event(
+                eventCore: event,
+                userAction: .unknown,
+                inputLanguage: .japanese,
+                liveConversionEnabled: false,
+                enableDebugWindow: false,
+                enableSuggestion: false
+            )
+            guard case .consume = action, case .fallthrough = callback else {
+                Issue.record("Expected Ctrl unknown to be consumed in \(state) state, got \(action), \(callback)")
+                return
+            }
+        }
+    }
+}
+
+@Test func testCtrlUnknownInNoneStateFallsThrough() {
+    // composing中でない場合は、アプリ側のショートカットが発火するようfallthroughされる
+    let controlShiftOEvent = makeControlEvent(
+        logicalKey: "o",
+        characters: "O",
+        modifiers: [.control, .shift],
+        keyCode: 31
+    )
+    let (action, callback) = InputState.none.event(
+        eventCore: controlShiftOEvent,
+        userAction: .unknown,
+        inputLanguage: .japanese,
+        liveConversionEnabled: false,
+        enableDebugWindow: false,
+        enableSuggestion: false
+    )
+    guard case .fallthrough = action, case .fallthrough = callback else {
+        Issue.record("Expected Ctrl+Shift unknown in none state to fall through, got \(action), \(callback)")
+        return
+    }
+}
+
+@Test func testEisuKeepsCompositionWhenSwitchingToEnglish() {
+    let event = makeControlEvent(
+        logicalKey: nil,
+        characters: nil,
+        modifiers: [],
+        keyCode: 102
+    )
+    let composingStates: [InputState] = [.composing, .previewing, .replaceSuggestion]
+    for state in composingStates {
+        let (action, callback) = state.event(
+            eventCore: event,
+            userAction: .英数,
+            inputLanguage: .japanese,
+            liveConversionEnabled: false,
+            enableDebugWindow: false,
+            enableSuggestion: false
+        )
+        guard case .selectInputLanguage(.english) = action, case .fallthrough = callback else {
+            Issue.record("Expected Eisu in \(state) to keep composition while switching, got \(action), \(callback)")
+            return
+        }
+    }
+}
+
+@Test func testKanaDoesNotDropJapaneseComposition() {
+    let event = makeControlEvent(
+        logicalKey: nil,
+        characters: nil,
+        modifiers: [],
+        keyCode: 104
+    )
+    let composingStates: [InputState] = [.composing, .previewing, .selecting, .replaceSuggestion]
+    for state in composingStates {
+        let (action, callback) = state.event(
+            eventCore: event,
+            userAction: .かな,
+            inputLanguage: .japanese,
+            liveConversionEnabled: false,
+            enableDebugWindow: false,
+            enableSuggestion: false
+        )
+        guard case .selectInputLanguage(.japanese) = action, case .fallthrough = callback else {
+            Issue.record("Expected Kana in Japanese \(state) to keep composition, got \(action), \(callback)")
+            return
+        }
+    }
+}
+
+@Test func testNonModifierUnknownStillFallsThroughDuringComposing() {
+    // Ctrlを伴わない.unknownは従来通りfallthroughされる（既存挙動の回帰防止）
+    let bareEvent = makeControlEvent(
+        logicalKey: nil,
+        characters: nil,
+        modifiers: [],
+        keyCode: 0
+    )
+    let (action, callback) = InputState.composing.event(
+        eventCore: bareEvent,
+        userAction: .unknown,
+        inputLanguage: .japanese,
+        liveConversionEnabled: false,
+        enableDebugWindow: false,
+        enableSuggestion: false
+    )
+    guard case .fallthrough = action, case .fallthrough = callback else {
+        Issue.record("Expected modifier-less unknown in composing state to fall through, got \(action), \(callback)")
+        return
+    }
+}
+
+@Test func testShiftArrowRoutesToEditSegmentInCompositionStates() {
+    let shiftLeftEvent = makeControlEvent(
+        logicalKey: nil,
+        characters: nil,
+        modifiers: [.shift],
+        keyCode: 123
+    )
+    let shiftRightEvent = makeControlEvent(
+        logicalKey: nil,
+        characters: nil,
+        modifiers: [.shift],
+        keyCode: 124
+    )
+
+    guard case .navigation(.left) = UserAction.getUserAction(eventCore: shiftLeftEvent, inputLanguage: .japanese) else {
+        Issue.record("Expected Shift+Left to be navigation(.left)")
+        return
+    }
+    guard case .navigation(.right) = UserAction.getUserAction(eventCore: shiftRightEvent, inputLanguage: .japanese) else {
+        Issue.record("Expected Shift+Right to be navigation(.right)")
+        return
+    }
+
+    let states: [InputState] = [.composing, .previewing, .selecting]
+    for state in states {
+        let (leftAction, _) = state.event(
+            eventCore: shiftLeftEvent,
+            userAction: .navigation(.left),
+            inputLanguage: .japanese,
+            liveConversionEnabled: false,
+            enableDebugWindow: false,
+            enableSuggestion: false
+        )
+        guard case .editSegment(-1) = leftAction else {
+            Issue.record("Expected Shift+Left in \(state) to edit segment left, got \(leftAction)")
+            return
+        }
+
+        let (rightAction, _) = state.event(
+            eventCore: shiftRightEvent,
+            userAction: .navigation(.right),
+            inputLanguage: .japanese,
+            liveConversionEnabled: false,
+            enableDebugWindow: false,
+            enableSuggestion: false
+        )
+        guard case .editSegment(1) = rightAction else {
+            Issue.record("Expected Shift+Right in \(state) to edit segment right, got \(rightAction)")
+            return
+        }
+    }
+}

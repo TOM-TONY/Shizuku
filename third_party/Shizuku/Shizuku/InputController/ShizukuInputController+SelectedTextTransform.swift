@@ -1,0 +1,546 @@
+import Cocoa
+import Core
+import Foundation
+import InputMethodKit
+
+// MARK: - Selected Text Transform Methods
+extension ShizukuInputController {
+
+    // MARK: - Constants
+    private enum Constants {
+        static let defaultContextLength = 200
+        static let cursorPositionTolerance = 2
+        static let replacementVerificationDelay = 0.1
+        static let clipboardDelay = 0.05
+        static let clipboardRestoreDelay = 0.3
+    }
+
+    struct TextContext {
+        let before: String
+        let selected: String
+        let after: String
+    }
+
+    private var endpoint: String {
+        if Config.OpenAiApiEndpoint().value.isEmpty {
+            Config.OpenAiApiEndpoint.default
+        } else {
+            Config.OpenAiApiEndpoint().value
+        }
+    }
+
+    @MainActor
+    func getContextAroundSelection(client: IMKTextInput, selectedRange: NSRange, contextLength: Int = Constants.defaultContextLength) -> TextContext {
+        // Get the selected text
+        var actualRange = NSRange()
+        let selectedText = client.string(from: selectedRange, actualRange: &actualRange) ?? ""
+
+        // Calculate context ranges
+        let documentLength = client.length()
+
+        // Get text before selection (up to contextLength characters)
+        let beforeStart = max(0, selectedRange.location - contextLength)
+        let beforeLength = selectedRange.location - beforeStart
+        let beforeRange = NSRange(location: beforeStart, length: beforeLength)
+
+        // Get text after selection (up to contextLength characters)
+        let afterStart = selectedRange.location + selectedRange.length
+        let afterLength = min(contextLength, documentLength - afterStart)
+        let afterRange = NSRange(location: afterStart, length: afterLength)
+
+        // Extract context strings
+        var beforeActualRange = NSRange()
+        let beforeText = (beforeLength > 0) ? (client.string(from: beforeRange, actualRange: &beforeActualRange) ?? "") : ""
+
+        var afterActualRange = NSRange()
+        let afterText = (afterLength > 0) ? (client.string(from: afterRange, actualRange: &afterActualRange) ?? "") : ""
+
+        self.appendDebugMessage("getContextAroundSelection: Before context: '\(beforeText)'")
+        self.appendDebugMessage("getContextAroundSelection: Selected text: '\(selectedText)'")
+        self.appendDebugMessage("getContextAroundSelection: After context: '\(afterText)'")
+
+        return TextContext(before: beforeText, selected: selectedText, after: afterText)
+    }
+
+    @MainActor
+    func showPromptInputWindow(initialPrompt: String? = nil) {
+        self.appendDebugMessage("showPromptInputWindow: Starting")
+
+        // Set flag to prevent recursive calls
+        self.isPromptWindowVisible = true
+
+        // Get selected text
+        guard let client = self.client() else {
+            self.appendDebugMessage("showPromptInputWindow: No client available")
+            self.isPromptWindowVisible = false
+            return
+        }
+
+        let selectedRange = client.selectedRange()
+        self.appendDebugMessage("showPromptInputWindow: Selected range in window: \(selectedRange)")
+
+        guard selectedRange.length > 0 else {
+            self.appendDebugMessage("showPromptInputWindow: No selected text in window")
+            self.isPromptWindowVisible = false
+            return
+        }
+
+        var actualRange = NSRange()
+        guard let selectedText = client.string(from: selectedRange, actualRange: &actualRange) else {
+            self.appendDebugMessage("showPromptInputWindow: Failed to get selected text")
+            self.isPromptWindowVisible = false
+            return
+        }
+
+        self.appendDebugMessage("showPromptInputWindow: Selected text: '\(selectedText)'")
+        self.appendDebugMessage("showPromptInputWindow: Storing selected range for later use: \(selectedRange)")
+
+        // Get context around selection
+        let context = self.getContextAroundSelection(client: client, selectedRange: selectedRange)
+
+        // Store the selected range and current app info for later use
+        let storedSelectedRange = selectedRange
+        let currentApp = NSWorkspace.shared.frontmostApplication
+
+        // Get cursor position for window placement
+        var cursorLocation = NSPoint.zero
+        var rect = NSRect.zero
+        client.attributes(forCharacterIndex: 0, lineHeightRectangle: &rect)
+        cursorLocation = rect.origin
+
+        self.appendDebugMessage("showPromptInputWindow: Cursor location: \(cursorLocation)")
+
+        // Show prompt input window with preview functionality
+        self.promptInputWindow.showPromptInput(
+            at: cursorLocation,
+            initialPrompt: initialPrompt,
+            originalText: selectedText,
+            onPreview: { [weak self] prompt, callback in
+                guard let self = self else {
+                    return
+                }
+                self.appendDebugMessage("showPromptInputWindow: Preview requested for prompt: '\(prompt)'")
+
+                Task {
+                    do {
+                        // Check if context should be included
+                        let includeContext = Config.IncludeContextInAITransform().value
+                        let result = try await self.getTransformationPreview(
+                            selectedText: selectedText,
+                            prompt: prompt,
+                            beforeContext: includeContext ? context.before : "",
+                            afterContext: includeContext ? context.after : ""
+                        )
+                        callback(result)
+                    } catch {
+                        await MainActor.run {
+                            self.appendDebugMessage("showPromptInputWindow: Preview error: \(error)")
+                        }
+                        callback("Error: \(error.localizedDescription)")
+                    }
+                }
+            },
+            onProofread: { [weak self] callback in
+                guard let self = self else {
+                    return
+                }
+                Task {
+                    do {
+                        let includeContext = Config.IncludeContextInAITransform().value
+                        let result = try await self.getProofreadResult(
+                            selectedText: selectedText,
+                            beforeContext: includeContext ? context.before : "",
+                            afterContext: includeContext ? context.after : ""
+                        )
+                        callback(result)
+                    } catch {
+                        callback("Error: \(error.localizedDescription)")
+                    }
+                }
+            },
+            onApply: { [weak self] transformedText in
+                guard let self = self else {
+                    return
+                }
+                self.appendDebugMessage("showPromptInputWindow: Applying transformed text: '\(transformedText)'")
+
+                // Close the window first, then restore focus and replace text
+                self.promptInputWindow.close()
+
+                // Restore focus to the original app
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    if let app = currentApp {
+                        app.activate(options: [])
+                        self.appendDebugMessage("showPromptInputWindow: Restored focus to original app")
+                    }
+
+                    // Replace text after focus is restored
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.replaceSelectedText(with: transformedText, usingRange: storedSelectedRange)
+                    }
+                }
+            },
+            completion: { [weak self] prompt in
+                self?.appendDebugMessage("showPromptInputWindow: Window closed with prompt: \(prompt ?? "nil")")
+                self?.isPromptWindowVisible = false
+
+                // Restore focus on cancel (prompt == nil) here so every closing path including window-level Esc ends up restoring focus.
+                if prompt == nil, let app = currentApp {
+                    app.activate(options: [])
+                    self?.appendDebugMessage("showPromptInputWindow: Restored focus to original app on cancel")
+                }
+                // 設定変更に備えてキャッシュを更新
+                self?.reloadPinnedPromptsCache()
+            }
+        )
+    }
+
+    @MainActor
+    func triggerAiTranslation(initialPrompt: String) -> Bool {
+        let aiBackendEnabled = Config.AIBackendPreference().value != .off
+        guard aiBackendEnabled else {
+            self.appendDebugMessage("AI translation ignored: AI backend is off")
+            return false
+        }
+        if self.isPromptWindowVisible {
+            self.appendDebugMessage("AI translation ignored: prompt window already visible")
+            return true
+        }
+        guard self.client() != nil else {
+            self.appendDebugMessage("AI translation ignored: No client available")
+            return false
+        }
+        self.showPromptInputWindow(initialPrompt: initialPrompt)
+        return true
+    }
+
+    @MainActor
+    func transformSelectedText(selectedText: String, prompt: String, beforeContext: String = "", afterContext: String = "") {
+        self.appendDebugMessage("transformSelectedText: Starting with text '\(selectedText)' and prompt '\(prompt)'")
+
+        let aiBackend = Config.AIBackendPreference().value
+        guard aiBackend != .off else {
+            self.appendDebugMessage("transformSelectedText: AI backend is not enabled")
+            return
+        }
+
+        self.appendDebugMessage("transformSelectedText: AI backend is enabled (\(aiBackend.rawValue)), starting request")
+
+        Task {
+            do {
+                // Create custom prompt for text transformation with context
+                var systemPrompt = """
+                Transform the given text according to the user's instructions.
+                Return only the transformed text without any additional explanation or formatting.
+                """
+
+                // Add context if available
+                if !beforeContext.isEmpty || !afterContext.isEmpty {
+                    systemPrompt += "\n\nContext information:"
+                    if !beforeContext.isEmpty {
+                        systemPrompt += "\nText before: ...\(beforeContext)"
+                    }
+                    systemPrompt += "\nText to transform: \(selectedText)"
+                    if !afterContext.isEmpty {
+                        systemPrompt += "\nText after: \(afterContext)..."
+                    }
+                } else {
+                    systemPrompt += "\n\nText to transform: \(selectedText)"
+                }
+
+                systemPrompt += "\n\nUser instructions: \(prompt)"
+
+                await MainActor.run {
+                    self.appendDebugMessage("transformSelectedText: Created system prompt")
+                }
+
+                let backend: AIBackend
+                switch aiBackend {
+                case .foundationModels:
+                    backend = .foundationModels
+                case .openAI:
+                    backend = .openAI
+                case .localLLM, .off:
+                    return
+                }
+
+                let apiKey = Config.OpenAiApiKey().value
+                if backend == .openAI {
+                    guard !apiKey.isEmpty else {
+                        await MainActor.run {
+                            self.appendDebugMessage("transformSelectedText: No OpenAI API key configured")
+                        }
+                        return
+                    }
+                }
+
+                await MainActor.run {
+                    let message = backend == .openAI
+                        ? "transformSelectedText: API key found, making request"
+                        : "transformSelectedText: Using Foundation Models, making request"
+                    self.appendDebugMessage(message)
+                }
+
+                let modelName = Config.OpenAiModelName().value
+                let result = try await AIClient.sendTextTransformRequest(
+                    systemPrompt,
+                    backend: backend,
+                    modelName: modelName,
+                    apiKey: apiKey,
+                    apiEndpoint: self.endpoint,
+                    logger: { [weak self] message in
+                        self?.appendDebugMessage(message)
+                    }
+                )
+
+                await MainActor.run {
+                    self.appendDebugMessage("transformSelectedText: API request completed, result: \(result)")
+                    self.appendDebugMessage("transformSelectedText: Result obtained: '\(result)'")
+                    // Note: This method lacks the stored range information.
+                    // Text replacement should be handled by showPromptInputWindow instead.
+                    self.appendDebugMessage("transformSelectedText: Note - This path should not be used for text replacement")
+                }
+            } catch {
+                await MainActor.run {
+                    self.appendDebugMessage("transformSelectedText: Error occurred: \(error)")
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func replaceSelectedText(with newText: String, usingRange storedRange: NSRange) {
+        self.appendDebugMessage("replaceSelectedText: Starting with new text: '\(newText)'")
+        self.appendDebugMessage("replaceSelectedText: Using stored range: \(storedRange)")
+
+        guard let client = self.client() else {
+            self.appendDebugMessage("replaceSelectedText: No client available")
+            return
+        }
+
+        // Check current selection for comparison
+        let currentSelectedRange = client.selectedRange()
+        self.appendDebugMessage("replaceSelectedText: Current selected range: \(currentSelectedRange)")
+        self.appendDebugMessage("replaceSelectedText: Stored range to use: \(storedRange)")
+
+        if storedRange.length > 0 {
+            self.appendDebugMessage("replaceSelectedText: Starting text replacement")
+
+            // Simplified approach: Try IMK first, fallback to clipboard if needed
+            if !self.replaceTextUsingIMK(newText: newText, storedRange: storedRange) {
+                self.replaceTextUsingClipboard(newText: newText, storedRange: storedRange)
+            }
+        } else {
+            self.appendDebugMessage("replaceSelectedText: Stored range has no length")
+        }
+    }
+
+    // Simplified replacement methods
+
+    @MainActor
+    private func replaceTextUsingIMK(newText: String, storedRange: NSRange) -> Bool {
+        self.appendDebugMessage("replaceTextUsingIMK: Attempting IMK text replacement")
+
+        guard let client = self.client() else {
+            self.appendDebugMessage("replaceTextUsingIMK: No client available")
+            return false
+        }
+
+        // Try direct replacement using IMK
+        self.insertClientText(newText, replacementRange: storedRange, client: client)
+
+        // Verify the replacement worked by checking cursor position
+        DispatchQueue.main.asyncAfter(deadline: .now() + Constants.replacementVerificationDelay) {
+            let currentRange = client.selectedRange()
+            let expectedLocation = storedRange.location + newText.count
+
+            if abs(currentRange.location - expectedLocation) <= Constants.cursorPositionTolerance {
+                self.appendDebugMessage("replaceTextUsingIMK: IMK replacement appears successful")
+            } else {
+                self.appendDebugMessage("replaceTextUsingIMK: IMK replacement may have failed")
+            }
+        }
+
+        return true // Assume success, fallback will handle failures
+    }
+
+    @MainActor
+    private func replaceTextUsingClipboard(newText: String, storedRange: NSRange) {
+        self.appendDebugMessage("replaceTextUsingClipboard: Starting clipboard-based replacement")
+
+        guard let client = self.client() else {
+            self.appendDebugMessage("replaceTextUsingClipboard: No client available")
+            return
+        }
+
+        // Store and set clipboard
+        let pasteboard = NSPasteboard.general
+        let originalContent = pasteboard.string(forType: .string)
+
+        pasteboard.clearContents()
+        pasteboard.setString(newText, forType: .string)
+
+        // Set selection and paste
+        self.setClientMarkedText("", selectionRange: storedRange, replacementRange: storedRange, client: client)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Constants.clipboardDelay) {
+            // Simulate Cmd+V
+            if let source = CGEventSource(stateID: .hidSystemState),
+               let cmdVDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true),
+               let cmdVUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false) {
+
+                cmdVDown.flags = .maskCommand
+                cmdVUp.flags = .maskCommand
+                cmdVDown.post(tap: .cghidEventTap)
+                cmdVUp.post(tap: .cghidEventTap)
+            }
+
+            // Restore clipboard after delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + Constants.clipboardRestoreDelay) {
+                if let original = originalContent {
+                    pasteboard.clearContents()
+                    pasteboard.setString(original, forType: .string)
+                }
+            }
+        }
+    }
+
+    // Get transformation preview without applying it
+    func getTransformationPreview(selectedText: String, prompt: String, beforeContext: String = "", afterContext: String = "") async throws -> String {
+        await MainActor.run {
+            self.appendDebugMessage("getTransformationPreview: Starting preview request")
+        }
+
+        let aiBackend = Config.AIBackendPreference().value
+        guard aiBackend != .off else {
+            await MainActor.run {
+                self.appendDebugMessage("getTransformationPreview: AI backend is not enabled")
+            }
+            throw NSError(domain: "TransformationError", code: -1, userInfo: [NSLocalizedDescriptionKey: "AI transformation is not available. Please enable AI backend in preferences."])
+        }
+        // llm-ime: ローカル LLM は ConverterServer 内で動く（IME 本体はサンドボックス内でモデルを読めない）
+        if aiBackend == .localLLM {
+            return try await self.transformWithLocalLLM(
+                text: selectedText,
+                instruction: prompt,
+                before: beforeContext,
+                after: afterContext
+            )
+        }
+
+        // Create custom prompt for text transformation with context
+        var systemPrompt = """
+        Transform the given text according to the user's instructions.
+        Return only the transformed text without any additional explanation or formatting.
+        """
+
+        // Add context if available
+        if !beforeContext.isEmpty || !afterContext.isEmpty {
+            systemPrompt += "\n\nContext information:"
+            if !beforeContext.isEmpty {
+                systemPrompt += "\nText before: ...\(beforeContext)"
+            }
+            systemPrompt += "\nText to transform: \(selectedText)"
+            if !afterContext.isEmpty {
+                systemPrompt += "\nText after: \(afterContext)..."
+            }
+        } else {
+            systemPrompt += "\n\nText to transform: \(selectedText)"
+        }
+
+        systemPrompt += "\n\nUser instructions: \(prompt)"
+
+        let backend: AIBackend
+        switch aiBackend {
+        case .foundationModels:
+            backend = .foundationModels
+        case .openAI:
+            backend = .openAI
+        case .localLLM, .off:
+            throw NSError(domain: "TransformationError", code: -1, userInfo: [NSLocalizedDescriptionKey: "AI transformation is not available. Please enable AI backend in preferences."])
+        }
+
+        let apiKey = Config.OpenAiApiKey().value
+        if backend == .openAI {
+            guard !apiKey.isEmpty else {
+                await MainActor.run {
+                    self.appendDebugMessage("getTransformationPreview: No OpenAI API key configured")
+                }
+                throw NSError(domain: "TransformationError", code: -2, userInfo: [NSLocalizedDescriptionKey: "OpenAI API key is missing. Please configure your API key in preferences."])
+            }
+        }
+
+        await MainActor.run {
+            self.appendDebugMessage("getTransformationPreview: Sending preview request (\(backend.rawValue))")
+        }
+
+        let modelName = Config.OpenAiModelName().value
+        let result = try await AIClient.sendTextTransformRequest(
+            systemPrompt,
+            backend: backend,
+            modelName: modelName,
+            apiKey: apiKey,
+            apiEndpoint: self.endpoint,
+            logger: { [weak self] message in
+                self?.appendDebugMessage(message)
+            }
+        )
+
+        await MainActor.run {
+            self.appendDebugMessage("getTransformationPreview: Preview result: '\(result)'")
+        }
+
+        return result
+    }
+
+    /// llm-ime: ConverterServer のローカル LLM（Gemma 4 12B / 31B）で書き換える。生成に数秒かかるため、
+    /// キー入力の順序付きキューを通さずに送る。
+    func transformWithLocalLLM(text: String, instruction: String, before: String, after: String) async throws -> String {
+        let response: ConverterServerResponse? = await withCheckedContinuation { continuation in
+            Task { @MainActor in
+                self.converterServerClient.sendUnordered(
+                    { _ in .localLLM(.transform(text: text, instruction: instruction, before: before, after: after)) }
+                ) { response in
+                    continuation.resume(returning: response)
+                }
+            }
+        }
+        guard let result = response?.localLLMResult else {
+            throw NSError(domain: "TransformationError", code: -3, userInfo: [NSLocalizedDescriptionKey: "変換サーバーから応答がありませんでした。"])
+        }
+        if let error = result.error {
+            throw NSError(domain: "TransformationError", code: -4, userInfo: [NSLocalizedDescriptionKey: error])
+        }
+        return result.text ?? ""
+    }
+
+    /// llm-ime: 添削（明らかな誤りだけを直した文章を返す）。ローカル LLM は ConverterServer の添削用の指示で、
+    /// それ以外の AI は同じ趣旨の指示による書き換えで行う。
+    func getProofreadResult(selectedText: String, beforeContext: String, afterContext: String) async throws -> String {
+        if Config.AIBackendPreference().value == .localLLM {
+            let response: ConverterServerResponse? = await withCheckedContinuation { continuation in
+                Task { @MainActor in
+                    self.converterServerClient.sendUnordered(
+                        { _ in .localLLM(.proofread(text: selectedText, before: beforeContext, after: afterContext)) }
+                    ) { response in
+                        continuation.resume(returning: response)
+                    }
+                }
+            }
+            guard let result = response?.localLLMResult else {
+                throw NSError(domain: "TransformationError", code: -3, userInfo: [NSLocalizedDescriptionKey: "変換サーバーから応答がありませんでした。"])
+            }
+            if let error = result.error {
+                throw NSError(domain: "TransformationError", code: -4, userInfo: [NSLocalizedDescriptionKey: error])
+            }
+            return result.text ?? selectedText
+        }
+        let output = try await self.getTransformationPreview(
+            selectedText: selectedText,
+            prompt: "誤字、脱字、変換ミス、助詞や文法の明らかな誤りだけを直す。言い回し・読点・表記は変えない。誤りがなければそのまま返す",
+            beforeContext: beforeContext,
+            afterContext: afterContext
+        )
+        return LocalLLMPrompts.cleanProofreadOutput(output)
+    }
+}

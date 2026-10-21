@@ -1,0 +1,1429 @@
+//
+//  KanaKanjiConverter.swift
+//  AzooKeyKanaKanjiConverter
+//
+//  Created by ensan on 2020/09/03.
+//  Copyright © 2020 ensan. All rights reserved.
+//
+
+import Algorithms
+import EfficientNGram
+public import Foundation
+import SwiftUtils
+
+/// かな漢字変換の管理を受け持つクラス
+public final class KanaKanjiConverter {
+    /// 1つのConverterを複数の入力セッションで共有するための識別子。
+    public struct ConversionSessionID: Hashable, Sendable {
+        fileprivate let rawValue: String
+    }
+
+    public enum ConversionSessionError: Error, Equatable, Sendable {
+        case unknownSession(ConversionSessionID)
+    }
+
+    private let converter: Kana2Kanji
+    private struct ConversionSessionState {
+        var previousInputData: ComposingText?
+        var lattice: Lattice = .init()
+        var completedData: Candidate?
+        var zenzaiCache: Kana2Kanji.ZenzaiCache?
+        var zenzaiTypoCache: ZenzaiTypoGenerationCache = .init()
+        var ngramCache: NGramCache = .init()
+        var predictiveInputCache: PredictiveInputCacheEntry?
+        var stablePredictionCandidateCache: StablePredictionCandidateCacheEntry?
+        var lastData: DicdataElement?
+    }
+    private static let defaultSessionID = ConversionSessionID(rawValue: "default")
+
+    public init(dicdataStore: DicdataStore) {
+        self.converter = .init(dicdataStore: dicdataStore)
+        self.dicdataStoreState = dicdataStore.prepareState()
+    }
+    public convenience init(dictionaryURL: URL, preloadDictionary: Bool = false) {
+        let dicdataStore = DicdataStore(dictionaryURL: dictionaryURL, preloadDictionary: preloadDictionary)
+        self.init(dicdataStore: dicdataStore)
+    }
+    static func withoutDictionary() -> KanaKanjiConverter {
+        KanaKanjiConverter(dictionaryURL: URL(fileURLWithPath: "/dev/null"), preloadDictionary: false)
+    }
+
+    nonisolated public static let defaultSpecialCandidateProviders: [any SpecialCandidateProvider] = [
+        CalendarSpecialCandidateProvider(),
+        EmailAddressSpecialCandidateProvider(),
+        UnicodeSpecialCandidateProvider(),
+        VersionSpecialCandidateProvider(),
+        TimeExpressionSpecialCandidateProvider(),
+        CommaSeparatedNumberSpecialCandidateProvider()
+    ]
+    private var checker = SpellChecker()
+    private var checkerInitialized: [KeyboardLanguage: Bool] = [.none: true, .ja_JP: true]
+
+    // 前回の変換や確定の情報を取っておく部分。
+    private var sessions: [ConversionSessionID: ConversionSessionState] = [
+        KanaKanjiConverter.defaultSessionID: .init()
+    ]
+    private var activeSessionID = KanaKanjiConverter.defaultSessionID
+    /// Zenzaiのためのzenzモデル
+    private var zenz: Zenz?
+    /// 完全な入力・文脈・制約をキーにする純粋なメモ化結果。
+    /// compositionではなく、このConverterインスタンスの寿命に紐づける。
+    var zenzaiMemoizationCache = ZenzaiMemoizationCache()
+    private var zenzaiPersonalization: (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)?
+    public private(set) var zenzStatus: String = ""
+    private var dicdataStoreState: DicdataStoreState
+
+    private var currentSessionState: ConversionSessionState {
+        self.sessions[self.activeSessionID] ?? .init()
+    }
+
+    private func updateCurrentSessionState(_ update: (inout ConversionSessionState) -> Void) {
+        var state = self.currentSessionState
+        update(&state)
+        self.sessions[self.activeSessionID] = state
+    }
+
+    /// 独立した変換状態を持つセッションを作成します。
+    ///
+    /// 辞書、モデル、学習データ、Converter単位のメモ化キャッシュは同じ
+    /// `KanaKanjiConverter`インスタンス内で共有されます。
+    public func createSession() -> ConversionSessionID {
+        let sessionID = ConversionSessionID(rawValue: UUID().uuidString)
+        self.sessions[sessionID] = .init()
+        return sessionID
+    }
+
+    /// 作成済みの変換セッションを破棄します。
+    public func removeSession(_ sessionID: ConversionSessionID) {
+        guard sessionID != Self.defaultSessionID else {
+            self.sessions[sessionID] = .init()
+            return
+        }
+        self.sessions[sessionID] = nil
+        if self.activeSessionID == sessionID {
+            self.activeSessionID = Self.defaultSessionID
+        }
+    }
+
+    /// 指定したセッションを有効にして同期処理を実行します。
+    ///
+    /// `KanaKanjiConverter`はスレッドセーフではありません。複数の実行コンテキストから
+    /// 利用する場合、呼び出し側でこのメソッドを含むConverterアクセスを直列化してください。
+    /// `operation`終了時には、ネストした呼び出しを含めて元のセッションへ戻ります。
+    public func withSession<Result>(
+        _ sessionID: ConversionSessionID,
+        operation: () throws -> Result
+    ) throws -> Result {
+        guard self.sessions[sessionID] != nil else {
+            throw ConversionSessionError.unknownSession(sessionID)
+        }
+        let previousSessionID = self.activeSessionID
+        self.activeSessionID = sessionID
+        defer {
+            self.activeSessionID = previousSessionID
+        }
+        return try operation()
+    }
+
+    private func withScratchSession<T>(_ body: () -> T) -> T {
+        let scratchID = ConversionSessionID(rawValue: "scratch-\(UUID().uuidString)")
+        self.sessions[scratchID] = self.currentSessionState
+        let previousSessionID = self.activeSessionID
+        let savedPersonalization = self.zenzaiPersonalization
+        self.activeSessionID = scratchID
+        defer {
+            self.activeSessionID = previousSessionID
+            self.zenzaiPersonalization = savedPersonalization
+            self.sessions[scratchID] = nil
+        }
+        return body()
+    }
+
+    /// リセットする関数
+    public func stopComposition() {
+        self.zenz?.endSession()
+        self.zenzaiPersonalization = nil
+        self.sessions[self.activeSessionID] = .init()
+    }
+
+    /// Zenzaiの純粋なメモ化結果を明示的に破棄します。
+    ///
+    /// 通常の変換確定では呼ぶ必要はありません。メモリ警告を受けた場合など、
+    /// compositionを終了せずに再計算可能なキャッシュだけを解放したい場合に利用します。
+    public func purgeZenzaiMemoizationCache() {
+        self.zenzaiMemoizationCache = .init()
+    }
+
+    private func getZenzaiPersonalization(mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode?) -> (mode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode, base: EfficientNGram, personal: EfficientNGram)? {
+        guard let mode else {
+            return nil
+        }
+        if let zenzaiPersonalization, zenzaiPersonalization.mode == mode {
+            return zenzaiPersonalization
+        }
+        let tokenizer = ZenzTokenizer()
+        let baseModel = EfficientNGram(baseFilename: mode.baseNgramLanguageModel, n: mode.n, d: mode.d, tokenizer: tokenizer)
+        let personalModel = EfficientNGram(baseFilename: mode.personalNgramLanguageModel, n: mode.n, d: mode.d, tokenizer: tokenizer)
+        self.zenzaiPersonalization = (mode, baseModel, personalModel)
+        return (mode, baseModel, personalModel)
+    }
+
+    private func cachedPredictiveInputText(
+        context: PredictiveInputCacheContext,
+        composingText: ComposingText,
+        count: Int
+    ) -> (predictedText: String, suffixCount: Int)? {
+        guard let predictiveInputCache = self.currentSessionState.predictiveInputCache else {
+            return nil
+        }
+        guard predictiveInputCache.context == context else {
+            self.invalidatePredictiveInputCache()
+            return nil
+        }
+        guard let predictedText = predictiveInputCache.remainingPrediction(
+            currentConvertTarget: composingText.convertTarget,
+            count: count
+        ) else {
+            self.invalidatePredictiveInputCache()
+            return nil
+        }
+        return (predictedText, 0)
+    }
+
+    private func invalidatePredictiveInputCache() {
+        self.updateCurrentSessionState {
+            $0.predictiveInputCache = nil
+        }
+    }
+
+    private func invalidateStablePredictionCandidateCache() {
+        self.updateCurrentSessionState {
+            $0.stablePredictionCandidateCache = nil
+        }
+    }
+
+    private func stablePredictionCandidates(
+        composingText: ComposingText,
+        inputStyle: InputStyle
+    ) -> [Candidate] {
+        guard let stablePredictionCandidateCache = self.currentSessionState.stablePredictionCandidateCache else {
+            return []
+        }
+        let source = self.converter.resolvePredictiveInputSource(composingText: composingText, inputStyle: inputStyle)
+        let candidates = stablePredictionCandidateCache.compatibleCandidates(
+            currentConvertTarget: composingText.convertTarget,
+            baseConvertTarget: source.baseConvertTarget,
+            possibleNexts: source.possibleNexts
+        )
+        if candidates.isEmpty {
+            self.invalidateStablePredictionCandidateCache()
+        }
+        return candidates
+    }
+
+    private func updateStablePredictionCandidateCache(
+        inputData: ComposingText,
+        inputStyle: InputStyle,
+        candidates: [Candidate]
+    ) {
+        guard !candidates.isEmpty else {
+            self.invalidateStablePredictionCandidateCache()
+            return
+        }
+        let source = self.converter.resolvePredictiveInputSource(composingText: inputData, inputStyle: inputStyle)
+        self.updateCurrentSessionState {
+            $0.stablePredictionCandidateCache = .init(
+                originalConvertTarget: inputData.convertTarget,
+                suffixCount: source.droppedSuffixCount,
+                candidates: candidates
+            )
+        }
+    }
+
+    private func mergeStableCandidates(
+        stableCandidates: [Candidate],
+        otherCandidates: [Candidate],
+        limit: Int
+    ) -> [Candidate] {
+        guard limit > 0 else {
+            return []
+        }
+        let uniqueStableCandidates = self.getUniqueCandidate(stableCandidates)
+        if uniqueStableCandidates.count >= limit {
+            return Array(uniqueStableCandidates.prefix(limit))
+        }
+        let seenCandidates = Set(uniqueStableCandidates.map(\.text))
+        let additionalCandidates = self.getUniqueCandidate(otherCandidates, seenCandidates: seenCandidates)
+            .min(count: limit - uniqueStableCandidates.count, sortedBy: {$0.value > $1.value})
+        return uniqueStableCandidates + additionalCandidates
+    }
+
+    /// Load the shared conversion model without converting text or changing learning data.
+    /// Call before accepting input when a newly installed model may need device compilation.
+    @discardableResult
+    public func prepareZenzaiModel(at modelURL: URL) -> Bool {
+        self.getModel(modelURL: modelURL) != nil
+    }
+
+    package func getModel(modelURL: URL) -> Zenz? {
+        if let model = self.zenz, model.resourceURL == modelURL {
+            self.zenzStatus = "load \(modelURL.absoluteString)"
+            return model
+        } else {
+            do {
+                self.zenz = try Zenz.shared(resourceURL: modelURL)
+                self.purgeZenzaiMemoizationCache()
+                self.sessions = self.sessions.mapValues { state in
+                    let next = state
+                    next.zenzaiTypoCache.invalidateForModelChange()
+                    return next
+                }
+                self.zenzStatus = "load \(modelURL.absoluteString)"
+                return self.zenz
+            } catch {
+                self.zenzStatus = "load \(modelURL.absoluteString)    " + error.localizedDescription
+                return nil
+            }
+        }
+    }
+
+    package func predictNextInputText(
+        leftSideContext: String,
+        composingText: ComposingText,
+        count: Int,
+        minLength: Int = 1,
+        maxEntropy: Float?,
+        options: ConvertRequestOptions,
+        inputStyle: InputStyle = .direct,
+        debugPossibleNexts: Bool = false
+    ) -> (predictedText: String, suffixCount: Int) {
+        guard options.zenzaiMode.enabled else {
+            self.invalidatePredictiveInputCache()
+            print("zenz mode is disabled")
+            return ("", 0)
+        }
+        guard case .v3 = options.zenzaiMode.versionDependentMode else {
+            self.invalidatePredictiveInputCache()
+            print("input prediction requires zenz-v3 models")
+            return ("", 0)
+        }
+        let cacheContext = PredictiveInputCacheContext(
+            leftSideContext: leftSideContext,
+            inputStyle: inputStyle,
+            weightURL: options.zenzaiMode.weightURL,
+            versionDependentConfig: options.zenzaiMode.versionDependentMode
+        )
+        if let cachedPrediction = self.cachedPredictiveInputText(
+            context: cacheContext,
+            composingText: composingText,
+            count: count
+        ) {
+            return cachedPrediction
+        }
+        guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+            self.invalidatePredictiveInputCache()
+            print("zenz-v3 model unavailable")
+            return ("", 0)
+        }
+        let source = self.converter.resolvePredictiveInputSource(composingText: composingText, inputStyle: inputStyle)
+        if debugPossibleNexts {
+            print("possibleNexts:", source.possibleNexts)
+        }
+        let predictedText = zenz.predictNextInputText(
+            leftSideContext: leftSideContext,
+            composingText: source.baseConvertTarget,
+            count: count,
+            minLength: minLength,
+            maxEntropy: maxEntropy,
+            versionDependentConfig: options.zenzaiMode.versionDependentMode,
+            possibleNexts: source.possibleNexts
+        )
+        if predictedText.isEmpty {
+            self.invalidatePredictiveInputCache()
+        } else {
+            self.updateCurrentSessionState {
+                $0.predictiveInputCache = .init(
+                    context: cacheContext,
+                    originalConvertTarget: composingText.convertTarget,
+                    suffixCount: source.droppedSuffixCount,
+                    predictedText: predictedText
+                )
+            }
+        }
+        return (predictedText, source.droppedSuffixCount)
+    }
+
+    /// LMベース typo correction の候補を返す実験的API。
+    /// - Warning: このAPIは experimental であり、予告なく変更または削除される可能性があります。
+    /// llm-ime: 読み（かな）が、左文脈のもとで変換用 zenz にとってどれだけもっともらしいか（対数確率）を返す。
+    /// 打鍵ミス訂正で、訂正版と入力どおりの読みを比べて誤った訂正を抑えるために使う。
+    /// - v2: `EE00 読み [EE02 文脈] EE01` 全体（文脈との整合も含む）
+    /// - v3: `[EE02 文脈] EE00` のあとに `読み EE01` が出る確率
+    public func experimentalReadingLogProbability(
+        reading: String,
+        leftSideContext: String,
+        options: ConvertRequestOptions
+    ) -> Float? {
+        guard options.zenzaiMode.enabled,
+              let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+            return nil
+        }
+        let katakana = reading.toKatakana()
+        let context = String(leftSideContext.suffix(40))
+        switch options.zenzaiMode.versionDependentMode {
+        case .v2:
+            let body = katakana + (context.isEmpty ? "" : "\u{EE02}" + context) + "\u{EE01}"
+            return zenz.sequenceLogProbability(prefix: "\u{EE00}", body: body)
+        case .v3:
+            let prefix = (context.isEmpty ? "" : "\u{EE02}" + context) + "\u{EE00}"
+            return zenz.sequenceLogProbability(prefix: prefix, body: katakana + "\u{EE01}")
+        }
+    }
+
+    public func experimentalRequestTypoCorrection(
+        leftSideContext: String,
+        composingText: ComposingText,
+        options: ConvertRequestOptions,
+        inputStyle: InputStyle,
+        config: ExperimentalTypoCorrectionConfig = .init()
+    ) -> [ZenzaiTypoCandidate] {
+        debug("[Warning] KanaKanjiConverter.experimentalRequestTypoCorrection is experimental and may change without notice.")
+        switch config.languageModel {
+        case .zenz:
+            guard options.zenzaiMode.enabled else {
+                debug("zenz mode is disabled")
+                return []
+            }
+            guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+                debug("zenz model unavailable")
+                return []
+            }
+            return zenz.generateTypoCandidates(
+                leftSideContext: leftSideContext,
+                composingText: composingText,
+                inputStyle: inputStyle,
+                experimentalConfig: config,
+                cache: self.currentSessionState.zenzaiTypoCache
+            )
+        case .ngram:
+            guard let context = ZenzaiTypoCandidateGenerator.resolveNGramContext(
+                experimentalConfig: config,
+                cache: self.currentSessionState.ngramCache
+            ) else {
+                return []
+            }
+            return ZenzaiTypoCandidateGenerator.generate(
+                context: context,
+                leftSideContext: leftSideContext,
+                composingText: composingText,
+                inputStyle: inputStyle,
+                experimentalConfig: config,
+                cache: self.currentSessionState.zenzaiTypoCache
+            )
+        }
+    }
+
+    /// 直前のLMベース typo correctionが行った探索量。性能テスト・診断用。
+    var latestExperimentalTypoCorrectionMetrics: ZenzaiTypoGenerationMetrics {
+        self.currentSessionState.zenzaiTypoCache.lastMetrics
+    }
+
+    /// 入力する言語が分かったらこの関数をなるべく早い段階で呼ぶことで、SpellCheckerの初期化が行われ、変換がスムーズになる
+    public func setKeyboardLanguage(_ language: KeyboardLanguage) {
+        self.dicdataStoreState.updateKeyboardLanguage(language)
+        if !checkerInitialized[language, default: false] {
+            switch language {
+            case .en_US:
+                _ = self.checker.completions(forPartialWordRange: NSRange(location: 0, length: 1), in: "a", language: "en-US")
+                self.checkerInitialized[language] = true
+            case .el_GR:
+                _ = self.checker.completions(forPartialWordRange: NSRange(location: 0, length: 1), in: "a", language: "el-GR")
+                self.checkerInitialized[language] = true
+            case .none, .ja_JP:
+                checkerInitialized[language] = true
+            }
+        }
+    }
+
+    /// 動的ユーザ辞書を引数に与えたデータで上書きします。
+    /// - Parameters:
+    ///   - dicdata: ユーザ辞書エントリです。動的ユーザ辞書エントリは検索効率が悪いため、現実的な件数に抑えてください。
+    ///   - shortcuts: ユーザショートカットエントリです。Rubyに完全一致する場合のみ利用されます。こちらも現実的な件数に抑えてください。
+    public func importDynamicUserDictionary(_ dicdata: [DicdataElement], shortcuts: [DicdataElement] = []) {
+        self.dicdataStoreState.importDynamicUserDictionary(dicdata, shortcuts: shortcuts)
+    }
+
+    public func updateUserDictionaryURL(_ newURL: URL, forceReload: Bool = false) {
+        self.dicdataStoreState.updateUserDictionaryURL(newURL, forceReload: forceReload)
+    }
+
+    public func updateLearningConfig(_ newConfig: LearningConfig) {
+        self.dicdataStoreState.updateLearningConfig(newConfig)
+    }
+
+    /// 確定操作後、内部状態のキャッシュを変更する関数。
+    /// - Parameters:
+    ///   - candidate: 確定された候補。
+    public func setCompletedData(_ candidate: Candidate) {
+        self.updateCurrentSessionState {
+            $0.completedData = candidate
+        }
+    }
+
+    /// 予測候補を未確定入力に受け入れる。
+    /// 候補の残りの読みを入力へ追加し、以降の変換と予測を受け入れた表記で始まるものに制約する。
+    /// - Parameters:
+    ///   - candidate: 受け入れる予測候補。`ConversionResult.predictionResults` の要素を渡す。
+    ///   - composingText: 候補を受け入れる未確定入力。
+    /// - Returns: 候補が現在の入力に適用でき、入力と制約を更新した場合は `true`。それ以外は `false`。
+    /// - Note:
+    ///   この関数は候補の再計算を行わない。更新後の `composingText` を使って `requestCandidates(_:options:)` を呼び出すこと。
+    ///   受け入れた表記による先頭の制約は Zenzai の変換でだけ使われる。
+    @discardableResult
+    public func acceptPredictionCandidate(_ candidate: Candidate, composingText: inout ComposingText) -> Bool {
+        guard !composingText.isEmpty, composingText.isAtEndIndex else {
+            return false
+        }
+        let candidateRuby = candidate.data.map(\.ruby).joined().toHiragana()
+        guard !candidateRuby.isEmpty else {
+            return false
+        }
+        let inputStyle = composingText.input.last?.inputStyle ?? .direct
+        let source = self.converter.resolvePredictiveInputSource(
+            composingText: composingText,
+            inputStyle: inputStyle
+        )
+        let currentRuby = source.baseConvertTarget.toHiragana()
+        guard candidateRuby.hasPrefix(currentRuby), candidateRuby.count > currentRuby.count else {
+            return false
+        }
+        let remainingRuby = String(candidateRuby.dropFirst(currentRuby.count))
+
+        if source.droppedSuffixCount > 0 {
+            composingText.deleteBackwardFromCursorPosition(count: source.droppedSuffixCount)
+        }
+        composingText.insertAtCursorPosition(remainingRuby, inputStyle: .direct)
+
+        // 前のキー入力の予測は先頭を決める前の文脈のものなので捨てる
+        self.invalidateStablePredictionCandidateCache()
+        self.updateCurrentSessionState {
+            $0.zenzaiCache = $0.zenzaiCache?.settingPrefixCandidate(candidate)
+                ?? Kana2Kanji.ZenzaiCache(
+                    $0.previousInputData ?? ComposingText(),
+                    constraint: .init([]),
+                    satisfyingCandidate: candidate,
+                    evaluatedSatisfyingCandidate: candidate,
+                    prefixCandidate: candidate
+                )
+        }
+        return true
+    }
+
+    /// 確定操作後、学習メモリをアップデートする関数。
+    /// - Parameters:
+    ///   - candidate: 確定された候補。
+    /// - Warning:
+    ///   `commitUpdateLearningData`を呼び出すまで永続化されません。
+    public func updateLearningData(_ candidate: Candidate) {
+        self.dicdataStoreState.updateLearningData(candidate, with: self.currentSessionState.lastData)
+        self.updateCurrentSessionState {
+            $0.lastData = candidate.data.last
+        }
+    }
+
+    /// 確定操作後、学習メモリをアップデートする関数。
+    /// - Parameters:
+    ///   - candidate: 確定された候補。
+    /// - Warning:
+    ///   `commitUpdateLearningData`を呼び出すまで永続化されません。
+    public func updateLearningData(_ candidate: Candidate, with predictionCandidate: PostCompositionPredictionCandidate) {
+        self.dicdataStoreState.updateLearningData(candidate, with: predictionCandidate)
+        self.updateCurrentSessionState {
+            $0.lastData = predictionCandidate.lastData
+        }
+    }
+
+    /// 確定操作後の学習メモリの更新を確定させます。
+    public func commitUpdateLearningData() {
+        self.dicdataStoreState.saveMemory()
+    }
+
+    /// 確定操作後の学習メモリの更新を確定させます。
+    public func forgetMemory(_ candidate: Candidate) {
+        self.dicdataStoreState.forgetMemory(candidate)
+    }
+
+    /// 確定操作後の学習メモリの更新を確定させます。
+    public func resetMemory() {
+        self.dicdataStoreState.resetMemory()
+    }
+
+    /// 賢い変換候補を生成する関数。
+    /// - Parameters:
+    ///   - string: 入力されたString
+    /// - Returns:
+    ///   `賢い変換候補
+    private func getSpecialCandidate(_ inputData: ComposingText, options: ConvertRequestOptions) -> [Candidate] {
+        options.specialCandidateProviders.flatMap { provider in
+            provider.provideCandidates(converter: self, inputData: inputData, options: options)
+        }
+    }
+
+    /// 変換候補の重複を除去する関数。
+    /// - Parameters:
+    ///   - candidates: uniqueを実行する候補列。
+    /// - Returns:
+    ///   `candidates`から重複を削除したもの。
+    private func getUniqueCandidate(_ candidates: some Sequence<Candidate>, seenCandidates: Set<String> = []) -> [Candidate] {
+        var result = [Candidate]()
+        var textIndex = [String: Int]()
+        result.reserveCapacity(candidates.underestimatedCount)
+        textIndex.reserveCapacity(candidates.underestimatedCount)
+        for candidate in candidates where !candidate.text.isEmpty && !seenCandidates.contains(candidate.text) {
+            if let index = textIndex[candidate.text] {
+                if result[index].value < candidate.value || result[index].rubyCount < candidate.rubyCount {
+                    result[index] = candidate
+                }
+            } else {
+                textIndex[candidate.text] = result.endIndex
+                result.append(candidate)
+            }
+        }
+        return result
+    }
+
+    /// 変換候補の重複を除去する関数。
+    /// - Parameters:
+    ///   - candidates: uniqueを実行する候補列。
+    /// - Returns:
+    ///   `candidates`から重複を削除したもの。
+    private func getUniquePostCompositionPredictionCandidate(_ candidates: some Sequence<PostCompositionPredictionCandidate>, seenCandidates: Set<String> = []) -> [PostCompositionPredictionCandidate] {
+        var result = [PostCompositionPredictionCandidate]()
+        for candidate in candidates where !candidate.text.isEmpty && !seenCandidates.contains(candidate.text) {
+            if let index = result.firstIndex(where: {$0.text == candidate.text}) {
+                if result[index].value < candidate.value {
+                    result[index] = candidate
+                }
+            } else {
+                result.append(candidate)
+            }
+        }
+        return result
+    }
+
+    /// 外国語への予測変換候補を生成する関数
+    /// - Parameters:
+    ///   - inputData: 変換対象のデータ。
+    ///   - language: 言語コード。現在は`en-US`と`el(ギリシャ語)`のみ対応している。
+    /// - Returns:
+    ///   予測変換候補
+    private func getForeignPredictionCandidate(inputData: ComposingText, language: String, penalty: PValue = -5) -> [Candidate] {
+        switch language {
+        case "en-US":
+            var result: [Candidate] = []
+            let ruby = String(inputData.input.compactMap {
+                if case let .character(c) = $0.piece { c } else { nil }
+            })
+            let range = NSRange(location: 0, length: ruby.utf16.count)
+            if !ruby.onlyRomanAlphabet {
+                return result
+            }
+            if let completions = checker.completions(forPartialWordRange: range, in: ruby, language: language) {
+                if !completions.isEmpty {
+                    let data = [DicdataElement(ruby: ruby, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: penalty)]
+                    let candidate: Candidate = Candidate(
+                        text: ruby,
+                        value: penalty,
+                        composingCount: .inputCount(inputData.input.count),
+                        lastMid: MIDData.一般.mid,
+                        data: data
+                    )
+                    result.append(candidate)
+                }
+                var value: PValue = -5 + penalty
+                let delta: PValue = -10 / PValue(completions.count)
+                for word in completions {
+                    let data = [DicdataElement(ruby: word, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: value)]
+                    let candidate: Candidate = Candidate(
+                        text: word,
+                        value: value,
+                        composingCount: .inputCount(inputData.input.count),
+                        lastMid: MIDData.一般.mid,
+                        data: data
+                    )
+                    result.append(candidate)
+                    value += delta
+                }
+            }
+            return result
+        case "el":
+            var result: [Candidate] = []
+            let ruby = String(inputData.input.compactMap {
+                if case let .character(c) = $0.piece { c } else { nil }
+            })
+            let range = NSRange(location: 0, length: ruby.utf16.count)
+            if let completions = checker.completions(forPartialWordRange: range, in: ruby, language: language) {
+                if !completions.isEmpty {
+                    let data = [DicdataElement(ruby: ruby, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: penalty)]
+                    let candidate: Candidate = Candidate(
+                        text: ruby,
+                        value: penalty,
+                        composingCount: .inputCount(inputData.input.count),
+                        lastMid: MIDData.一般.mid,
+                        data: data
+                    )
+                    result.append(candidate)
+                }
+                var value: PValue = -5 + penalty
+                let delta: PValue = -10 / PValue(completions.count)
+                for word in completions {
+                    let data = [DicdataElement(ruby: word, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: value)]
+                    let candidate: Candidate = Candidate(
+                        text: word,
+                        value: value,
+                        composingCount: .inputCount(inputData.input.count),
+                        lastMid: MIDData.一般.mid,
+                        data: data
+                    )
+                    result.append(candidate)
+                    value += delta
+                }
+            }
+            return result
+        default:
+            return []
+        }
+    }
+
+    /// 予測変換候補を生成する関数
+    /// - Parameters:
+    ///   - sums: 変換対象のデータ。
+    /// - Returns:
+    ///   予測変換候補
+    private func getPredictionCandidate(_ bestCandidateDataForPrediction: consuming CandidateData, composingText: ComposingText, options: ConvertRequestOptions, prefixText: String? = nil) -> [Candidate] {
+        // 予測変換は次の方針で行う。
+        // prepart: 前半文節 lastPart: 最終文節とする。
+        // まず、lastPartがnilであるところから始める
+
+        var candidates: [Candidate] = []
+        var prepart = consume bestCandidateDataForPrediction
+        var lastpart: CandidateData.ClausesUnit?
+        var count = 0
+        while true {
+            if count == 2 {
+                break
+            }
+            if prepart.isEmpty {
+                break
+            }
+            if let oldlastPart = lastpart {
+                // 現在の最終分節をもう1つ取得
+                let lastUnit = prepart.clauses.popLast()!   // prepartをmutatingでlastを取る。
+                var newUnit = lastUnit.clause               // 新しいlastpartとなる部分。
+                newUnit.merge(with: oldlastPart.clause)     // マージする。(最終文節の範囲を広げたことになる)
+                let newValue = lastUnit.value + oldlastPart.value
+                let newlastPart: CandidateData.ClausesUnit = (clause: newUnit, value: newValue)
+                let predictions = converter.getPredictionCandidates(composingText: composingText, prepart: prepart, lastClause: newlastPart.clause, N_best: 5, dicdataStoreState: self.dicdataStoreState)
+                lastpart = newlastPart
+                // 結果がemptyでなければ
+                if !predictions.isEmpty {
+                    candidates.append(contentsOf: consume predictions)
+                    count += 1
+                }
+            } else {
+                // 最終分節を取得
+                lastpart = prepart.clauses.popLast()
+                // 予測変換を受け取る
+                let predictions = converter.getPredictionCandidates(composingText: composingText, prepart: prepart, lastClause: lastpart!.clause, N_best: 5, dicdataStoreState: self.dicdataStoreState)
+                // 結果がemptyでなければ
+                if !predictions.isEmpty {
+                    // 結果に追加
+                    candidates.append(contentsOf: consume predictions)
+                    count += 1
+                }
+            }
+        }
+        // 入力全体を使って予測候補を作る
+        if !prepart.isEmpty, let lastpart {
+            var fullClause = prepart.clauses.first!.clause
+            for unit in prepart.clauses.dropFirst() {
+                fullClause.merge(with: unit.clause)
+            }
+            fullClause.merge(with: lastpart.clause)
+            let emptyPrepart = CandidateData(clauses: [], data: [])
+            let predictions = converter.getPredictionCandidates(
+                composingText: composingText,
+                prepart: emptyPrepart,
+                lastClause: fullClause,
+                N_best: 5,
+                dicdataStoreState: self.dicdataStoreState
+            )
+            print(fullClause.text, predictions)
+            candidates.append(contentsOf: consume predictions)
+        }
+        // 辞書の予測は最後の文節を読みで引き直すため、先頭の表記を含まない候補が出る。それは除く
+        if let prefixText {
+            candidates.removeAll { !$0.text.hasPrefix(prefixText) }
+        }
+        if !candidates.isEmpty {
+            return candidates
+        }
+        guard options.zenzaiMode.enabled, options.experimentalZenzaiPredictiveInput else {
+            return []
+        }
+        let leftSideContext: String = switch options.zenzaiMode.versionDependentMode {
+        case .v2(let mode):
+            mode.leftSideContext ?? ""
+        case .v3(let mode):
+            mode.leftSideContext ?? ""
+        }
+
+        let inputStyle = composingText.input.last?.inputStyle ?? .direct
+        let (predictedText, suffixCount) = self.predictNextInputText(
+            leftSideContext: leftSideContext,
+            composingText: composingText,
+            count: 10,
+            minLength: 1,
+            maxEntropy: 3.0,
+            options: options,
+            inputStyle: inputStyle
+        )
+        guard !predictedText.isEmpty else {
+            return []
+        }
+
+        let insertText = (inputStyle == .roman2kana) ? predictedText.toHiragana() : predictedText
+        var predictedComposingText = composingText
+        if suffixCount > 0 {
+            predictedComposingText.deleteBackwardFromCursorPosition(count: suffixCount)
+        }
+        predictedComposingText.insertAtCursorPosition(insertText, inputStyle: inputStyle)
+
+        var fallbackOptions = options
+        fallbackOptions.requireJapanesePrediction = .disabled
+        fallbackOptions.requireEnglishPrediction = .disabled
+        // 別セッションで変換候補を生成
+        let predictedResult = self.withScratchSession {
+            self.requestCandidates(predictedComposingText, options: fallbackOptions)
+        }
+        guard let firstCandidate = predictedResult.mainResults.first else {
+            return []
+        }
+        if let prefixText, !firstCandidate.text.hasPrefix(prefixText) {
+            return []
+        }
+        return [firstCandidate]
+    }
+
+    /// トップレベルに追加する付加的な変換候補を生成する関数
+    /// - Parameters:
+    ///   - inputData: 変換対象のInputData。
+    /// - Returns:
+    ///   付加的な変換候補
+    private func getTopLevelAdditionalCandidate(_ inputData: ComposingText, options: ConvertRequestOptions) -> [Candidate] {
+        var candidates: [Candidate] = []
+        if options.englishCandidateInRoman2KanaInput, inputData.input.allSatisfy({
+            if case let .character(c) = $0.piece { c.isASCII } else { false }
+        }) {
+            candidates.append(contentsOf: self.getForeignPredictionCandidate(inputData: inputData, language: "en-US", penalty: -10))
+        }
+        return candidates
+    }
+    /// 部分がカタカナである可能性を調べる
+    /// 小さいほどよい。
+    private func getKatakanaScore<S: StringProtocol>(_ katakana: S) -> PValue {
+        var score: PValue = 1
+        // テキスト分析によってこれらのカタカナが入っている場合カタカナ語である可能性が高いと分かった。
+        for c in katakana {
+            if "プヴペィフ".contains(c) {
+                score *= 0.5
+            } else if "ュピポ".contains(c) {
+                score *= 0.6
+            } else if "パォグーム".contains(c) {
+                score *= 0.7
+            }
+        }
+        return score
+    }
+
+    /// 付加的な変換候補を生成する関数
+    /// - Parameters:
+    ///   - inputData: 変換対象のInputData。
+    /// - Returns:
+    ///   付加的な変換候補
+    private func getAdditionalCandidate(_ inputData: ComposingText, options: ConvertRequestOptions) -> [Candidate] {
+        var candidates: [Candidate] = []
+        let string = inputData.convertTarget.toKatakana()
+        let composingCount: ComposingCount = .inputCount(inputData.input.count)
+        do {
+            // カタカナ
+            let value = -14 * getKatakanaScore(string)
+            let data = DicdataElement(ruby: string, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: value)
+            let katakana = Candidate(
+                text: string,
+                value: value,
+                composingCount: composingCount,
+                lastMid: MIDData.一般.mid,
+                data: [data]
+            )
+            candidates.append(katakana)
+        }
+        let hiraganaString = string.toHiragana()
+        do {
+            // ひらがな
+            let data = DicdataElement(word: hiraganaString, ruby: string, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -14.5)
+
+            let hiragana = Candidate(
+                text: hiraganaString,
+                value: -14.5,
+                composingCount: composingCount,
+                lastMid: MIDData.一般.mid,
+                data: [data]
+            )
+            candidates.append(hiragana)
+        }
+        do {
+            // 大文字
+            let word = string.uppercased()
+            let data = DicdataElement(word: word, ruby: string, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -15)
+            let uppercasedLetter = Candidate(
+                text: word,
+                value: -14.6,
+                composingCount: composingCount,
+                lastMid: MIDData.一般.mid,
+                data: [data]
+            )
+            candidates.append(uppercasedLetter)
+        }
+        if options.fullWidthRomanCandidate {
+            // 全角英数字
+            let word = string.applyingTransform(.fullwidthToHalfwidth, reverse: true) ?? ""
+            let data = DicdataElement(word: word, ruby: string, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -15)
+            let fullWidthLetter = Candidate(
+                text: word,
+                value: -14.7,
+                composingCount: composingCount,
+                lastMid: MIDData.一般.mid,
+                data: [data]
+            )
+            candidates.append(fullWidthLetter)
+        }
+        if options.halfWidthKanaCandidate {
+            // 半角カタカナ
+            let word = string.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? ""
+            let data = DicdataElement(word: word, ruby: string, cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -15)
+            let halfWidthKatakana = Candidate(
+                text: word,
+                value: -15,
+                composingCount: composingCount,
+                lastMid: MIDData.一般.mid,
+                data: [data]
+            )
+            candidates.append(halfWidthKatakana)
+        }
+
+        return candidates
+    }
+
+    /// `Candidate.text` がテンプレート展開済みでも、辞書内の表記を使って制約できるようにする。
+    private func prefixText(of candidate: Candidate) -> String {
+        let dictionaryText = candidate.data.map(\.word).joined()
+        return dictionaryText.isEmpty ? candidate.text : dictionaryText
+    }
+
+    private func candidates(_ candidates: [Candidate], matchingPrefix prefixText: String?) -> [Candidate] {
+        guard let prefixText else {
+            return candidates
+        }
+        return candidates.filter { $0.text.hasPrefix(prefixText) }
+    }
+
+    /// 確定済みのテンプレート部分は再展開せず、その表示を維持して残りだけを展開する。
+    private func prepareCandidateForResult(_ candidate: inout Candidate, prefixCandidate: Candidate?) {
+        candidate.withActions(self.getAppropriateActions(candidate))
+        if let prefixCandidate {
+            let rawPrefixText = self.prefixText(of: prefixCandidate)
+            if rawPrefixText != prefixCandidate.text, candidate.text.hasPrefix(rawPrefixText) {
+                candidate.text = prefixCandidate.text + String(candidate.text.dropFirst(rawPrefixText.count))
+                candidate.isLearningTarget = false
+            }
+        }
+        candidate.parseTemplate()
+    }
+
+    /// ラティスを処理し変換候補の形にまとめる関数
+    /// - Parameters:
+    ///   - inputData: 変換対象のInputData。
+    ///   - result: convertToLatticeによって得られた結果。
+    ///   - options: リクエストにかかるオプション。
+    /// - Returns:
+    ///   重複のない変換候補。
+    /// - Note:
+    ///   現在の実装は非常に複雑な方法で候補の順序を決定している。
+    private func processResult(inputData: ComposingText, result: (result: LatticeNode, lattice: Lattice), options: ConvertRequestOptions) -> ConversionResult {
+        self.updateCurrentSessionState {
+            $0.previousInputData = inputData
+            $0.lattice = result.lattice
+        }
+        let inputStyle = inputData.input.last?.inputStyle ?? .direct
+        let prefixCandidate = options.zenzaiMode.enabled ? self.currentSessionState.zenzaiCache?.prefixCandidate : nil
+        // テンプレート候補の `text` は表示用に展開済みなので、ラティスや辞書候補との比較には元の表記を使う。
+        let prefixText = prefixCandidate.map { self.prefixText(of: $0) }
+        // 比較的大きい配列（〜1000、2000程度の候補が含まれることがある）
+        let clauseResult = result.result.getCandidateData()
+        if clauseResult.isEmpty {
+            self.invalidateStablePredictionCandidateCache()
+            let candidates = self.candidates(
+                self.getUniqueCandidate(self.getAdditionalCandidate(inputData, options: options)),
+                matchingPrefix: prefixText
+            )
+            return ConversionResult(mainResults: candidates, predictionResults: [], englishPredictionResults: [], firstClauseResults: candidates)   // アーリーリターン
+        }
+
+        // 予測変換用のベスト候補
+        var bestCandidateDataForPrediction: CandidateData?
+        // 文章全体を変換した場合の候補上位5件を作る（不要なときはlazyで中間配列を避ける）
+        let wholeSentenceUniqueCandidates: [Candidate]
+        if options.requireJapanesePrediction.isEnabled {
+            let clauseResultCandidates = clauseResult.map { self.converter.processClauseCandidate($0) }
+            let candidatePairs = zip(clauseResult, clauseResultCandidates)
+            let prefixPairs = prefixText.map { text in candidatePairs.filter { $0.1.text.hasPrefix(text) } } ?? []
+            bestCandidateDataForPrediction = prefixPairs.isEmpty
+                ? candidatePairs.max {$0.1.value < $1.1.value}!.0
+                : prefixPairs.max {$0.1.value < $1.1.value}!.0
+            wholeSentenceUniqueCandidates = self.getUniqueCandidate(clauseResultCandidates)
+        } else {
+            wholeSentenceUniqueCandidates = self.getUniqueCandidate(clauseResult.lazy.map { self.converter.processClauseCandidate($0) })
+        }
+        // ユーザショートカット（全文一致のみ）候補を抽出
+        let userShortcutsCandidates: [Candidate] = {
+            let ruby = inputData.convertTarget.toKatakana()
+            guard !ruby.isEmpty else {
+                return []
+            }
+            let dicdata = self.converter.dicdataStore.getPerfectMatchedUserShortcutsDicdata(ruby: ruby, state: self.dicdataStoreState)
+            let composingCount: ComposingCount = .surfaceCount(inputData.convertTarget.count)
+            return dicdata.map { data in
+                Candidate(
+                    text: data.word,
+                    value: data.value(),
+                    composingCount: composingCount,
+                    lastMid: data.mid,
+                    data: [data],
+                    actions: [],
+                    inputable: true,
+                    isLearningTarget: false
+                )
+            }
+        }()
+
+        if case .完全一致 = options.requestQuery {
+            self.invalidateStablePredictionCandidateCache()
+            let merged = self.candidates(
+                self.getUniqueCandidate(wholeSentenceUniqueCandidates.chained(userShortcutsCandidates)),
+                matchingPrefix: prefixText
+            )
+            if options.zenzaiMode.enabled {
+                return ConversionResult(mainResults: consume merged, predictionResults: [], englishPredictionResults: [], firstClauseResults: [])
+            } else {
+                return ConversionResult(mainResults: (consume merged).sorted(by: {$0.value > $1.value}), predictionResults: [], englishPredictionResults: [], firstClauseResults: [])
+            }
+        }
+        // モデル重みを統合
+        let bestFiveSentenceCandidates: [Candidate]
+        if options.zenzaiMode.enabled {
+            // FIXME: もう少し良い方法はありそうだけど、短期的にかなりハックな実装にした
+            // candidateのvalueをZenzaiの出力順に書き換えることで、このあとのrerank処理で騙されてくれるようになっている
+            // より根本的には、`Candidate`にAI評価値をもたせるなどの方法が必要そう
+            var first5 = Array(wholeSentenceUniqueCandidates.prefix(5))
+            let values = first5.map(\.value).sorted(by: >)
+            for (i, v) in zip(first5.indices, values) {
+                first5[i].value = v
+            }
+            bestFiveSentenceCandidates = first5
+        } else {
+            bestFiveSentenceCandidates = wholeSentenceUniqueCandidates.min(count: 5, sortedBy: {$0.value > $1.value})
+        }
+
+        var predictionResults: [Candidate] = []
+        var englishPredictionResults: [Candidate] = []
+        let fullCandidates: [Candidate]
+        do {
+            // 予測変換を最大3件作成する（必要な場合のみsumsを構築）
+            let bestThreePredictionCandidates: [Candidate]
+            var stablePredictionCandidates: [Candidate] = []
+            if options.requireJapanesePrediction.isEnabled, let bestCandidateDataForPrediction {
+                let candidates = self.getUniqueCandidate(
+                    self.getPredictionCandidate(bestCandidateDataForPrediction, composingText: inputData, options: options, prefixText: prefixText)
+                ).min(count: 3, sortedBy: {$0.value > $1.value})
+                stablePredictionCandidates = self.candidates(
+                    self.stablePredictionCandidates(
+                        composingText: inputData,
+                        inputStyle: inputStyle
+                    ),
+                    matchingPrefix: prefixText
+                )
+                predictionResults = self.mergeStableCandidates(
+                    stableCandidates: stablePredictionCandidates,
+                    otherCandidates: candidates,
+                    limit: 3
+                )
+                if options.requireJapanesePrediction.shouldMix {
+                    bestThreePredictionCandidates = predictionResults
+                } else {
+                    bestThreePredictionCandidates = []
+                }
+            } else {
+                self.invalidateStablePredictionCandidateCache()
+                bestThreePredictionCandidates = []
+            }
+            // 英単語の予測変換。appleのapiを使うため、処理が異なる。
+            var foreignCandidates: [Candidate] = []
+            if options.requireEnglishPrediction.isEnabled {
+                var englishCandidates: [Candidate] = []
+                englishCandidates.append(contentsOf: self.getForeignPredictionCandidate(inputData: inputData, language: "en-US"))
+                if options.keyboardLanguage == .el_GR {
+                    englishCandidates.append(contentsOf: self.getForeignPredictionCandidate(inputData: inputData, language: "el"))
+                }
+                englishPredictionResults = englishCandidates
+                if options.requireEnglishPrediction.shouldMix {
+                    foreignCandidates.append(contentsOf: englishCandidates)
+                }
+            }
+            // その他のトップレベル変換（先頭に表示されうる変換候補）
+            let topLevelAdditionalCandidates = self.getTopLevelAdditionalCandidate(inputData, options: options)
+            // best8、foreign_candidates、zeroHintPrediction_candidates、toplevel_additional_candidate、user_shortcuts を混ぜて上位5件を取得する
+            let mixedCandidates = self.candidates(
+                getUniqueCandidate(
+                    bestFiveSentenceCandidates
+                        .chained(consume bestThreePredictionCandidates)
+                        .chained(consume foreignCandidates)
+                        .chained(consume topLevelAdditionalCandidates)
+                        .chained(consume userShortcutsCandidates)
+                ),
+                matchingPrefix: prefixText
+            )
+            if options.requireJapanesePrediction.shouldMix {
+                fullCandidates = self.mergeStableCandidates(
+                    stableCandidates: stablePredictionCandidates,
+                    otherCandidates: mixedCandidates,
+                    limit: 5
+                )
+            } else {
+                fullCandidates = mixedCandidates.min(count: 5, sortedBy: {$0.value > $1.value})
+            }
+        }
+        // 文節のみ変換するパターン（上位5件）
+        let uniqueFirstClauseCandidates = self.candidates(
+            self.getUniqueCandidate((consume clauseResult).lazy.map {(candidateData: CandidateData) -> Candidate in
+                let first = candidateData.clauses.first!
+                let count = max(0, first.clause.dataEndIndex)
+                return Candidate(
+                    text: first.clause.text,
+                    value: first.value,
+                    composingCount: first.clause.ranges.reduce(into: .inputCount(0)) { $0 = .composite($0, $1.count) },
+                    lastMid: first.clause.mid,
+                    data: Array(candidateData.data[0...count])
+                )
+            }),
+            matchingPrefix: prefixText
+        )
+
+        var firstClauseResults = uniqueFirstClauseCandidates.min(count: 5) {
+            if $0.rubyCount == $1.rubyCount {
+                $0.value > $1.value
+            } else {
+                $0.rubyCount > $1.rubyCount
+            }
+        }
+        // 重複のない変換候補を作成するための集合
+        var seenCandidate: Set<String> = fullCandidates.mapSet {$0.text}
+        // 文節のみ変換するパターン（上位5件）
+        let firstClauseCandidates = self.getUniqueCandidate(consume uniqueFirstClauseCandidates, seenCandidates: seenCandidate).min(count: 5) {
+            if $0.rubyCount == $1.rubyCount {
+                $0.value > $1.value
+            } else {
+                $0.rubyCount > $1.rubyCount
+            }
+        }
+        for c in firstClauseCandidates {
+            seenCandidate.insert(c.text)
+        }
+        // 文字列の長さごとに並べ、かつその中で評価の高いものから順に並べる。
+        let wordCandidates: [Candidate]
+        do {
+            // 最初の辞書データ
+            let dicCandidates: [Candidate] = result.lattice[index: .bothIndex(inputIndex: 0, surfaceIndex: 0)]
+                .map {
+                    Candidate(
+                        text: $0.data.word,
+                        value: $0.data.value(),
+                        composingCount: $0.range.count,
+                        lastMid: $0.data.mid,
+                        data: [$0.data]
+                    )
+                }
+            // その他辞書データに追加する候補
+            let additionalCandidates: [Candidate] = self.getAdditionalCandidate(inputData, options: options)
+            var candidates = self.candidates(
+                self.getUniqueCandidate((consume dicCandidates).chained(consume additionalCandidates), seenCandidates: seenCandidate),
+                matchingPrefix: prefixText
+            ).sorted {
+                let count0 = $0.rubyCount
+                let count1 = $1.rubyCount
+                return count0 == count1 ? $0.value > $1.value : count0 > count1
+            }
+            for c in candidates {
+                seenCandidate.insert(c.text)
+            }
+            // 賢く変換するパターン（任意件数）
+            let wiseCandidates = self.candidates(
+                self.getUniqueCandidate(self.getSpecialCandidate(inputData, options: options), seenCandidates: seenCandidate),
+                matchingPrefix: prefixText
+            )
+            // 途中でwise_candidatesを挟む
+            candidates.insert(contentsOf: consume wiseCandidates, at: min(5, candidates.endIndex))
+            wordCandidates = consume candidates
+        }
+
+        self.updateStablePredictionCandidateCache(inputData: inputData, inputStyle: inputStyle, candidates: predictionResults)
+
+        var result = consume fullCandidates
+        // 3番目までに最低でも1つ、（誤り訂正ではなく）入力に完全一致する候補が入るようにする
+        let checkRuby: (Candidate) -> Bool = {$0.data.reduce(into: "") {$0 += $1.ruby} == inputData.convertTarget.toKatakana()}
+        if !result.prefix(3).contains(where: checkRuby) {
+            if let candidateIndex = result.dropFirst(3).firstIndex(where: checkRuby) {
+                // 3番目以降にある場合は順位を入れ替える
+                let candidate = result.remove(at: candidateIndex)
+                result.insert(candidate, at: min(result.endIndex, 2))
+            } else if let candidate = bestFiveSentenceCandidates.first(where: checkRuby) {
+                result.insert(candidate, at: min(result.endIndex, 2))
+            } else if let candidate = wholeSentenceUniqueCandidates.first(where: checkRuby) {
+                result.insert(candidate, at: min(result.endIndex, 2))
+            }
+        }
+
+        result.append(contentsOf: consume firstClauseCandidates)
+        result.append(contentsOf: consume wordCandidates)
+
+        result = self.candidates(consume result, matchingPrefix: prefixText)
+        predictionResults = self.candidates(consume predictionResults, matchingPrefix: prefixText)
+
+        result.mutatingForEach { item in
+            self.prepareCandidateForResult(&item, prefixCandidate: prefixCandidate)
+        }
+        firstClauseResults.mutatingForEach { item in
+            self.prepareCandidateForResult(&item, prefixCandidate: prefixCandidate)
+        }
+        predictionResults.mutatingForEach { item in
+            self.prepareCandidateForResult(&item, prefixCandidate: prefixCandidate)
+        }
+        englishPredictionResults.mutatingForEach { item in
+            item.withActions(self.getAppropriateActions(item))
+            item.parseTemplate()
+        }
+        return ConversionResult(mainResults: result, predictionResults: predictionResults, englishPredictionResults: englishPredictionResults, firstClauseResults: firstClauseResults)
+    }
+
+    /// 入力からラティスを構築する関数。状況に応じて呼ぶ関数を分ける。
+    /// - Parameters:
+    ///   - inputData: 変換対象のInputData。
+    ///   - N_best: 計算途中で保存する候補数。実際に得られる候補数とは異なる。
+    /// - Returns:
+    ///   結果のラティスノードと、計算済みノードの全体
+    private func convertToLattice(_ inputData: ComposingText, N_best: Int, zenzaiMode: ConvertRequestOptions.ZenzaiMode, needTypoCorrection: Bool) -> (result: LatticeNode, lattice: Lattice)? {
+        if inputData.convertTarget.isEmpty {
+            return nil
+        }
+
+        // FIXME: enable cache based zenzai
+        if zenzaiMode.enabled, let model = self.getModel(modelURL: zenzaiMode.weightURL) {
+            let (result, nodes, cache) = self.converter.all_zenzai(
+                inputData,
+                zenz: model,
+                zenzaiCache: self.currentSessionState.zenzaiCache,
+                zenzaiMemoizationCache: self.zenzaiMemoizationCache,
+                inferenceLimit: zenzaiMode.inferenceLimit,
+                requestRichCandidates: zenzaiMode.requestRichCandidates,
+                personalizationMode: self.getZenzaiPersonalization(mode: zenzaiMode.personalizationMode),
+                versionDependentConfig: zenzaiMode.versionDependentMode,
+                dicdataStoreState: self.dicdataStoreState
+            )
+            self.updateCurrentSessionState {
+                $0.previousInputData = inputData
+                $0.zenzaiCache = cache
+            }
+            return (result, nodes)
+        }
+
+        guard let previousInputData = self.currentSessionState.previousInputData else {
+            debug("\(#function): 新規計算用の関数を呼びますA")
+            let result = converter.kana2lattice_all(
+                inputData,
+                N_best: N_best,
+                needTypoCorrection: needTypoCorrection,
+                dicdataStoreState: self.dicdataStoreState
+            )
+            self.updateCurrentSessionState {
+                $0.previousInputData = inputData
+            }
+            return result
+        }
+
+        debug("\(#function): before \(previousInputData) after \(inputData)")
+
+        // 完全一致の場合
+        if previousInputData == inputData {
+            let result = converter.kana2lattice_no_change(N_best: N_best, previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice))
+            self.updateCurrentSessionState {
+                $0.previousInputData = inputData
+            }
+            return result
+        }
+
+        // 文節確定の後の場合
+        if let completedData = self.currentSessionState.completedData, previousInputData.inputHasSuffix(inputOf: inputData) {
+            debug("\(#function): 文節確定用の関数を呼びます、確定された文節は\(completedData)")
+            let result = converter.kana2lattice_afterComplete(inputData, completedData: completedData, N_best: N_best, previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice), needTypoCorrection: needTypoCorrection)
+            self.updateCurrentSessionState {
+                $0.previousInputData = inputData
+                $0.completedData = nil
+            }
+            return result
+        }
+
+        // TODO: 元々はsuffixになっていないが、文節確定の後であるケースで、確定された文節を考慮できるようにする
+        // へんかん|する → 変換 する|　のようなパターンで、previousInputData: へんかん, inputData: する, となることがある
+
+        let diff = inputData.differenceSuffix(to: previousInputData)
+
+        debug("\(#function): 最後尾文字置換用の関数を呼びます、差分は\(diff)")
+        let result = converter.kana2lattice_changed(
+            inputData,
+            N_best: N_best,
+            counts: diff,
+            previousResult: (inputData: previousInputData, lattice: self.currentSessionState.lattice),
+            needTypoCorrection: needTypoCorrection,
+            dicdataStoreState: self.dicdataStoreState
+        )
+        self.updateCurrentSessionState {
+            $0.previousInputData = inputData
+        }
+
+        return result
+    }
+
+    public func getAppropriateActions(_ candidate: Candidate) -> [CompleteAction] {
+        if ["[]", "()", "｛｝", "〈〉", "〔〕", "（）", "「」", "『』", "【】", "{}", "<>", "《》", "\"\"", "\'\'", "””"].contains(candidate.text) {
+            return [.moveCursor(-1)]
+        }
+        if ["{{}}"].contains(candidate.text) {
+            return [.moveCursor(-2)]
+        }
+        return []
+    }
+
+    /// 2つの連続する`Candidate`をマージする
+    public func mergeCandidates(_ left: Candidate, _ right: Candidate) -> Candidate {
+        converter.mergeCandidates(left, right)
+    }
+
+    /// 外部から呼ばれる変換候補を要求する関数。
+    /// - Parameters:
+    ///   - inputData: 変換対象のInputData。
+    ///   - options: リクエストにかかるパラメータ。
+    /// - Returns: `ConversionResult`
+    public func requestCandidates(_ inputData: ComposingText, options: ConvertRequestOptions) -> ConversionResult {
+        debug("requestCandidates 入力は", inputData)
+        // 変換対象が無の場合
+        if inputData.convertTarget.isEmpty {
+            return ConversionResult(mainResults: [], predictionResults: [], englishPredictionResults: [], firstClauseResults: [])
+        }
+        if options.shouldResetMemory {
+            self.resetMemory()
+        }
+        self.dicdataStoreState.updateIfRequired(options: options)
+        let needTypoCorrection = self.isClassicTypoCorrectionEnabled(options)
+
+        guard let result = self.convertToLattice(inputData, N_best: options.N_best, zenzaiMode: options.zenzaiMode, needTypoCorrection: needTypoCorrection) else {
+            return ConversionResult(mainResults: [], predictionResults: [], englishPredictionResults: [], firstClauseResults: [])
+        }
+        return self.processResult(inputData: inputData, result: result, options: options)
+    }
+
+    private func isClassicTypoCorrectionEnabled(_ options: ConvertRequestOptions) -> Bool {
+        switch options.typoCorrectionMode {
+        case .enabled:
+            return true
+        case .disabled:
+            return false
+        case .automatic:
+            #if os(iOS)
+            return true
+            #else
+            return false
+            #endif
+        }
+    }
+
+    /// 変換確定後の予測変換候補を要求する関数
+    public func requestPostCompositionPredictionCandidates(leftSideCandidate: Candidate, options: ConvertRequestOptions) -> [PostCompositionPredictionCandidate] {
+        // ゼロヒント予測変換に基づく候補を列挙
+        var zeroHintResults = self.getUniquePostCompositionPredictionCandidate(self.converter.getZeroHintPredictionCandidates(preparts: [leftSideCandidate], N_best: 15))
+        do {
+            // 助詞は最大3つに制限する
+            var joshiCount = 0
+            zeroHintResults = zeroHintResults.reduce(into: []) { results, candidate in
+                switch candidate.type {
+                case .additional(data: let data):
+                    if CIDData.isJoshi(cid: data.last?.rcid ?? CIDData.EOS.cid) {
+                        if joshiCount < 3 {
+                            results.append(candidate)
+                            joshiCount += 1
+                        }
+                    } else {
+                        results.append(candidate)
+                    }
+                case .replacement:
+                    results.append(candidate)
+                }
+            }
+        }
+
+        // 予測変換に基づく候補を列挙
+        let predictionResults = self.converter.getPredictionCandidates(
+            prepart: leftSideCandidate,
+            N_best: 15,
+            dicdataStoreState: self.dicdataStoreState
+        )
+        // 絵文字を追加
+        let replacer = options.textReplacer
+        var emojiCandidates: [PostCompositionPredictionCandidate] = []
+        for data in leftSideCandidate.data where DicdataStore.includeMMValueCalculation(data) {
+            let result = replacer.getSearchResult(query: data.word, target: [.emoji], ignoreNonBaseEmoji: true)
+            for emoji in result {
+                emojiCandidates.append(PostCompositionPredictionCandidate(text: emoji.text, value: -3, type: .additional(data: [.init(word: emoji.text, ruby: "エモジ", cid: CIDData.記号.cid, mid: MIDData.一般.mid, value: -3)])))
+            }
+        }
+        emojiCandidates = self.getUniquePostCompositionPredictionCandidate(emojiCandidates)
+
+        var results: [PostCompositionPredictionCandidate] = []
+        var seenCandidates: Set<String> = []
+
+        results.append(contentsOf: emojiCandidates.suffix(3))
+        for c in emojiCandidates.suffix(3) {
+            seenCandidates.insert(c.text)
+        }
+        // 残りの半分。ただしzeroHintResultsが足りない場合は全部で10個になるようにする。
+        let predictionsCount = max((10 - results.count) / 2, 10 - results.count - zeroHintResults.count)
+        let predictions = self.getUniquePostCompositionPredictionCandidate(predictionResults, seenCandidates: seenCandidates).min(count: predictionsCount, sortedBy: {$0.value > $1.value})
+        results.append(contentsOf: predictions)
+        for c in predictions {
+            seenCandidates.insert(c.text)
+        }
+
+        let zeroHints = self.getUniquePostCompositionPredictionCandidate(zeroHintResults, seenCandidates: seenCandidates)
+        results.append(contentsOf: zeroHints.min(count: 10 - results.count, sortedBy: {$0.value > $1.value}))
+        return results
+    }
+}

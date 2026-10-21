@@ -1,0 +1,34 @@
+同梱している AI のモデルについて
+
+■ Gemma 4（Google）
+  - 続きの予測: gemma-4-E4B / gemma-4-E2B を Apple Neural Engine 向けに変換し、重みを 6bit にパレット化したもの
+    （gemma4-e4b-ane, gemma4-e2b-ane）
+  - いい感じ変換・添削・書き直し:
+      mlx-community/gemma-4-12B-it-qat-4bit（gemma4-12b-it-mlx）
+      mlx-community/gemma-4-31B-it-qat-OptiQ-4bit（gemma4-31b-it-mlx。mlx-optiq による量子化）
+  - ライセンス: Apache License 2.0（https://ai.google.dev/gemma/docs/gemma_4_license）
+    全文は同じフォルダの swift-crypto.txt などにある Apache License 2.0 と同じです。
+    変換・量子化した重みは元のモデルからの派生物で、同じライセンスに従います。
+
+■ ruri-v3（cl-nagoya / Hayato Tsukagoshi, Ryohei Sasano）
+  - 本人の過去文から意味の近い手本を探す日本語の埋め込みモデル:
+      cl-nagoya/ruri-v3-30m を Core ML の fp16 に変換したもの（ruri-v3-30m-coreml）
+      https://huggingface.co/cl-nagoya/ruri-v3-30m
+  - 「解析と学習」に使う必須モデルとして、メモリの量にかかわらずインストールします（約 77 MB）。
+  - 元の重み・字句分割器・モデルカードの取得元は次のコミットに固定:
+      24899e5de370b56d179604a007c0d727bf144504
+  - 変換したモデルは長さ64・256次元。平均プーリングとL2正規化を含み、
+    検索用の接頭辞「検索クエリ: 」「検索文書: 」を使います。
+  - ライセンス: 固定したコミットのモデルカードの表記は Apache License 2.0。
+    全文は同じフォルダの ruri-v3.txt にあります。
+    変換した重みは元のモデルからの派生物で、同じライセンスに従います。
+
+■ zenz（Miwa Keita）
+  - かな漢字変換の Zenzai で使うモデル。IME 本体に含まれます
+      zenz-v2.5-medium を Apple Neural Engine 向けに変換したもの（https://huggingface.co/Miwa-Keita/zenz-v2.5-medium）
+      zenz-v3.1-small の GGUF（Q5_K_M）
+  - ライセンスは各モデルのページの表記に従います（zenz-v2.5 は CC BY-SA 4.0、
+    https://creativecommons.org/licenses/by-sa/4.0/ 。ANE 向けに変換したものも同じライセンスで配布します）
+
+■ azooKey の辞書・言語モデル
+  azooKey_dictionary_storage.txt を見てください。

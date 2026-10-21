@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- llm-ime: サンドボックスで動くコマンドラインのヘルパーには、バイナリに埋め込んだ Info.plist の CFBundleIdentifier が要る
+	     （ないとサンドボックスの初期化で落ちる: "Unable to get bundle identifier for container id"） -->
+	<key>CFBundleIdentifier</key>
+	<string>dev.tomonari.inputmethod.Shizuku.ShizukuLab</string>
+	<key>CFBundleName</key>
+	<string>ShizukuLab</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+</dict>
+</plist>

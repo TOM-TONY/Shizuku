@@ -1,0 +1,241 @@
+import Cocoa
+import Core
+import Foundation
+import SwiftUI
+
+extension Notification.Name {
+    static let navigateHistoryUp = Notification.Name("navigateHistoryUp")
+    static let navigateHistoryDown = Notification.Name("navigateHistoryDown")
+    static let textFieldFocusChanged = Notification.Name("textFieldFocusChanged")
+    static let requestTextFieldFocus = Notification.Name("requestTextFieldFocus")
+}
+
+final class PromptInputWindow: NSWindow {
+    private var completion: ((String?) -> Void)?
+    private var previewCallback: ((String, @escaping (String) -> Void) -> Void)?
+    private var proofreadCallback: ((@escaping (String) -> Void) -> Void)?
+    private var originalText: String = ""
+    private var applyCallback: ((String) -> Void)?
+    private var isTextFieldCurrentlyFocused: Bool = false
+    private var initialPrompt: String?
+    private var previousApp: NSRunningApplication?
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 200),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+
+        self.level = .floating
+        self.isReleasedWhenClosed = false
+        self.backgroundColor = NSColor.clear
+        self.hasShadow = true
+        self.acceptsMouseMovedEvents = true
+        // llm-ime: 動かせるウィンドウにする（実際の移動は PromptInputView の見出しのドラッグで行う）
+        self.isMovable = true
+        self.isMovableByWindowBackground = true
+
+        // Use native material backing
+        self.isOpaque = false
+        self.alphaValue = 1.0
+
+        setupUI()
+
+        // Listen for text field focus changes
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(textFieldFocusChanged(_:)),
+            name: .textFieldFocusChanged,
+            object: nil
+        )
+    }
+
+    @objc private func textFieldFocusChanged(_ notification: Notification) {
+        if let isFocused = notification.object as? Bool {
+            isTextFieldCurrentlyFocused = isFocused
+        }
+    }
+
+    private func setupUI() {
+        var contentView = PromptInputView(
+            initialPrompt: initialPrompt,
+            originalText: originalText,
+            onSubmit: { [weak self] prompt in
+                self?.completion?(prompt)
+                self?.close()
+            },
+            onPreview: { [weak self] prompt, _, callback in
+                self?.previewCallback?(prompt, callback)
+            },
+            onProofread: { [weak self] _, callback in
+                self?.proofreadCallback?(callback)
+            },
+            onApply: { [weak self] transformedText in
+                self?.applyCallback?(transformedText)
+            },
+            onCancel: { [weak self] in
+                self?.completion?(nil)
+                self?.close()
+            },
+            onPreviewModeChanged: { [weak self] isPreviewMode in
+                self?.resizeWindowToContent(isPreviewMode: isPreviewMode)
+            }
+        )
+
+        contentView.hostWindow = { [weak self] in self }
+        let hostingView = NSHostingView(rootView: contentView)
+        hostingView.layer?.cornerRadius = 16
+        hostingView.layer?.masksToBounds = true
+        self.contentView = hostingView
+    }
+
+    func showPromptInput(
+        at cursorLocation: NSPoint,
+        initialPrompt: String? = nil,
+        originalText: String = "",
+        onPreview: @escaping (String, @escaping (String) -> Void) -> Void,
+        onProofread: @escaping (@escaping (String) -> Void) -> Void = { $0("Error: 添削は使えません") },
+        onApply: @escaping (String) -> Void,
+        completion: @escaping (String?) -> Void
+    ) {
+        self.previewCallback = onPreview
+        self.proofreadCallback = onProofread
+        self.originalText = originalText
+        self.applyCallback = onApply
+        self.completion = completion
+        self.initialPrompt = initialPrompt
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        if let frontmostApp, frontmostApp.processIdentifier != NSRunningApplication.current.processIdentifier {
+            self.previousApp = frontmostApp
+        } else {
+            self.previousApp = nil
+        }
+
+        // Reset the window display state
+        resetWindowState()
+
+        // Initial resize to base size
+        resizeWindowToContent(isPreviewMode: false)
+
+        // Position window near cursor
+        var windowFrame = self.frame
+        windowFrame.origin = adjustWindowPosition(for: cursorLocation, windowSize: windowFrame.size)
+        self.setFrame(windowFrame, display: true)
+
+        self.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Set focus to text field with multiple attempts
+        focusTextField()
+    }
+
+    private func resizeWindowToContent(isPreviewMode: Bool) {
+        let headerHeight: CGFloat = 36  // Compact header
+        let textFieldHeight: CGFloat = 36  // Compact text field
+        let quickActionHeight: CGFloat = isPreviewMode ? 0 : 30  // llm-ime: 添削・書き直しのボタン
+        let historyHeight: CGFloat = isPreviewMode ? 0 : 200  // More space for 10 items when not in preview mode
+        let buttonHeight: CGFloat = 36  // Compact button row
+        let containerPadding: CGFloat = 16  // Reduced padding
+
+        // llm-ime: 添削の変更箇所の一覧や書き直しの差分を読めるよう、プレビューを広く取る
+        let previewHeight: CGFloat = isPreviewMode ? 280 : 0
+
+        let totalHeight = headerHeight + textFieldHeight + quickActionHeight + historyHeight + buttonHeight + previewHeight + containerPadding
+
+        var currentFrame = self.frame
+        let newSize = NSSize(width: isPreviewMode ? 480 : 380, height: totalHeight)
+
+        // Adjust origin to keep the window in the same relative position
+        currentFrame.origin.y += (currentFrame.size.height - newSize.height)
+        currentFrame.size = newSize
+
+        self.setFrame(currentFrame, display: true, animate: true)
+    }
+
+    private func resetWindowState() {
+        // Reset the SwiftUI view state by creating a new content view
+        setupUI()
+    }
+
+    private func focusTextField() {
+        // Make window key and active
+        NSApp.activate(ignoringOtherApps: true)
+        self.makeKeyAndOrderFront(nil)
+
+        // Single delayed focus request
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NotificationCenter.default.post(name: .requestTextFieldFocus, object: nil)
+        }
+    }
+
+    private func adjustWindowPosition(for cursorLocation: NSPoint, windowSize: NSSize) -> NSPoint {
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(cursorLocation, $0.frame, false) }) ?? NSScreen.main else {
+            return cursorLocation
+        }
+
+        let origin = WindowPositioning.promptWindowOrigin(
+            cursorLocation: WindowPositioning.Point(cursorLocation),
+            windowSize: WindowPositioning.Size(windowSize),
+            screenRect: WindowPositioning.Rect(screen.visibleFrame)
+        )
+        return origin.cgPoint
+    }
+
+    override func close() {
+        // Call completion handler to reset flags before closing
+        if let completion = self.completion {
+            completion(nil)
+        }
+
+        // Restore focus to the previous application
+        if let previousApp = self.previousApp {
+            DispatchQueue.main.async {
+                previousApp.activate(options: [])
+            }
+        }
+
+        super.close()
+        self.completion = nil
+        self.previewCallback = nil
+        self.applyCallback = nil
+    }
+
+    override var canBecomeKey: Bool {
+        true
+    }
+
+    override var canBecomeMain: Bool {
+        true
+    }
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Handle navigation keys at window level
+        if event.keyCode == 53 { // Escape key
+            // Send escape event to SwiftUI view and close window
+            completion?(nil)
+            close()
+        } else if event.keyCode == 126 { // Up arrow key
+            // Only handle up arrow if not in text field (CustomTextField handles it directly)
+            if !isTextFieldCurrentlyFocused {
+                NotificationCenter.default.post(name: .navigateHistoryUp, object: nil)
+            } else {
+                super.keyDown(with: event)
+            }
+        } else if event.keyCode == 125 { // Down arrow key
+            // Only handle down arrow if not in text field (CustomTextField handles it directly)
+            if !isTextFieldCurrentlyFocused {
+                NotificationCenter.default.post(name: .navigateHistoryDown, object: nil)
+            } else {
+                super.keyDown(with: event)
+            }
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+}

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- llm-ime: 解析と学習（ShizukuLab）。サンドボックスで動かし、ネットワークは使えない（network.client を付けない）。
+	     記録の写しと置き場所は App Group の中、モデルと変換の辞書は読み取り専用の例外で読む -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>YOURTEAMID.dev.tomonari.inputmethod.Shizuku</string>
+	</array>
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>/Library/Application Support/llm-ime/models/</string>
+		<string>/Library/Input Methods/Shizuku.app/</string>
+	</array>
+</dict>
+</plist>

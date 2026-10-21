@@ -1,0 +1,69 @@
+import Foundation
+#if canImport(UniformTypeIdentifiers)
+import UniformTypeIdentifiers
+#endif
+import KanaKanjiConverterModule
+
+public enum CustomInputTableStore {
+    /// The identifier used when registering the custom input table.
+    public static let tableName: String = "Shizuku.customRomajiTable"
+    private static let appSupportSubdir = "Shizuku"
+    private static let directoryName = "CustomInputTable"
+    private static let fileName = "custom_input_table.tsv"
+
+    static var directoryURL: URL {
+        if let root = WindowContextTestRuntime.root { return root.appendingPathComponent("storage/CustomInputTable", isDirectory: true) }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent(appSupportSubdir, isDirectory: true)
+            .appendingPathComponent(directoryName, isDirectory: true)
+    }
+
+    static var fileURL: URL {
+        #if canImport(UniformTypeIdentifiers) && !os(Linux)
+        return directoryURL.appendingPathComponent(fileName, conformingTo: .text)
+        #else
+        return directoryURL.appendingPathComponent(fileName)
+        #endif
+    }
+
+    @discardableResult
+    public static func save(exported: String) throws -> URL {
+        try ensureDirectoryExists()
+        let data = Data(exported.utf8)
+        try data.write(to: fileURL, options: [.atomic])
+        return fileURL
+    }
+
+    public static func load() -> String? {
+        guard exists() else {
+            return nil
+        }
+        return try? String(contentsOf: fileURL, encoding: .utf8)
+    }
+
+    public static func loadTable() -> InputTable? {
+        guard exists() else {
+            return nil
+        }
+        return try? InputStyleManager.loadTable(from: fileURL)
+    }
+
+    /// Load and register the custom input table if it exists.
+    /// Safe to call multiple times; later calls override previous registration.
+    @discardableResult
+    public static func registerIfExists() -> Bool {
+        guard exists(), let table = try? InputStyleManager.loadTable(from: fileURL) else {
+            return false
+        }
+        InputStyleManager.registerInputStyle(table: table, for: tableName)
+        return true
+    }
+
+    public static func exists() -> Bool {
+        FileManager.default.fileExists(atPath: fileURL.path)
+    }
+
+    private static func ensureDirectoryExists() throws {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+    }
+}

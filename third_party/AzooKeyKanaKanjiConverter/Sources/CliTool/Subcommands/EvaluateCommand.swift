@@ -1,0 +1,208 @@
+import ArgumentParser
+import Foundation
+import KanaKanjiConverterModuleWithDefaultDictionary
+import SwiftUtils
+
+extension Subcommands {
+    struct Evaluate: AsyncParsableCommand {
+        @Argument(help: "query, answer, tagを備えたjsonファイルへのパス")
+        var inputFile: String = ""
+
+        @Option(name: [.customLong("output")], help: "Output file path.")
+        var outputFilePath: String?
+        @OptionGroup
+        var options: SharedConversionOptions
+        @Flag(name: [.customLong("stable")], help: "Report only stable properties; timestamps and values will not be reported.")
+        var stable: Bool = false
+        @Flag(name: [.customLong("config_zenzai_ignore_left_context")], help: "ignore left_context")
+        var configZenzaiIgnoreLeftContext: Bool = false
+        @Flag(name: [.customLong("config_zenzai_ignore_right_context")], help: "ignore right_context")
+        var configZenzaiIgnoreRightContext: Bool = false
+
+        static let configuration = CommandConfiguration(commandName: "evaluate", abstract: "Evaluate quality of Conversion for input data.")
+
+        private func parseInputFile() throws -> [EvaluationInputItem] {
+            let url = URL(fileURLWithPath: self.inputFile)
+            let data = try Data(contentsOf: url)
+            return try JSONDecoder().decode([EvaluationInputItem].self, from: data)
+        }
+
+        mutating func run() async throws {
+            let inputItems = try parseInputFile()
+            let converter = KanaKanjiConverter.withDefaultDictionary()
+            var executionTime: Double = 0
+            var resultItems: [EvaluateItem] = []
+            for item in inputItems {
+                let start = Date()
+                // セットアップ
+                converter.importDynamicUserDictionary(
+                    (item.user_dictionary ?? []).map {
+                        DicdataElement(word: $0.word, ruby: $0.reading.toKatakana(), cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -10)
+                    }
+                )
+                // 変換
+                var composingText = ComposingText()
+                composingText.insertAtCursorPosition(item.query, inputStyle: .direct)
+                let requestOptions = try self.options.makeEvaluateRequestOptions(
+                    leftSideContext: item.left_context,
+                    rightSideContext: item.right_context,
+                    ignoreLeftContext: self.configZenzaiIgnoreLeftContext,
+                    ignoreRightContext: self.configZenzaiIgnoreRightContext
+                )
+                let result = converter.requestCandidates(composingText, options: requestOptions)
+                let mainResults = result.mainResults.filter {
+                    $0.data.reduce(into: "", {$0.append(contentsOf: $1.ruby)}) == item.query.toKatakana()
+                }
+                resultItems.append(
+                    EvaluateItem(
+                        query: item.query,
+                        answers: item.answer,
+                        left_context: item.left_context,
+                        right_context: item.right_context,
+                        outputs: mainResults.prefix(self.options.configNBest).map {
+                            EvaluateItemOutput(text: $0.text, score: Double($0.value))
+                        }
+                    )
+                )
+                executionTime += Date().timeIntervalSince(start)
+                // Explictly reset state
+                converter.stopComposition()
+            }
+            var result = EvaluateResult(n_best: self.options.configNBest, execution_time: executionTime, items: resultItems)
+            if stable {
+                result.execution_time = 0
+                result.timestamp = 0
+                result.items.mutatingForEach {
+                    $0.entropy = Double(Int($0.entropy * 10)) / 10
+                    $0.outputs.mutatingForEach {
+                        $0.score = Double(Int($0.score))
+                    }
+                }
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let json = try encoder.encode(result)
+
+            if let outputFilePath {
+                try json.write(to: URL(fileURLWithPath: outputFilePath))
+            } else {
+                let string = String(data: json, encoding: .utf8)!
+                print(string)
+            }
+        }
+    }
+
+    struct EvaluationInputItem: Codable {
+        /// 入力クエリ
+        var query: String
+
+        /// 正解データ（優先度順）
+        var answer: [String]
+
+        /// タグ
+        var tag: [String] = []
+
+        /// 左文脈
+        var left_context: String?
+
+        /// 右文脈
+        var right_context: String?
+
+        /// ユーザ辞書
+        var user_dictionary: [InputUserDictionaryItem]?
+    }
+
+    struct InputUserDictionaryItem: Codable {
+        /// 漢字
+        var word: String
+        /// 読み
+        var reading: String
+        /// ヒント
+        var hint: String?
+    }
+
+    struct EvaluateResult: Codable {
+        internal init(n_best: Int, timestamp: TimeInterval = Date().timeIntervalSince1970, execution_time: TimeInterval, items: [Subcommands.EvaluateItem]) {
+            self.n_best = n_best
+            self.timestamp = timestamp
+            self.execution_time = execution_time
+            self.items = items
+
+            var stat = EvaluateStat(query_count: items.count, ranks: [:])
+            for item in items {
+                stat.ranks[item.max_rank, default: 0] += 1
+            }
+            self.stat = stat
+        }
+
+        /// `N_Best`クエリ
+        var n_best: Int
+
+        /// タイムスタンプ
+        var timestamp = Date().timeIntervalSince1970
+
+        /// タイムスタンプ
+        var execution_time: TimeInterval
+
+        /// 統計情報
+        var stat: EvaluateStat
+
+        /// クエリと結果
+        var items: [EvaluateItem]
+    }
+
+    struct EvaluateStat: Codable {
+        var query_count: Int
+        var ranks: [Int: Int]
+    }
+
+    struct EvaluateItem: Codable {
+        init(query: String, answers: [String], left_context: String?, right_context: String?, outputs: [Subcommands.EvaluateItemOutput]) {
+            self.query = query
+            self.answers = answers
+            self.left_context = left_context ?? ""
+            self.right_context = right_context ?? ""
+            self.outputs = outputs
+            do {
+                // entropyを示す
+                let mean = outputs.reduce(into: 0) { $0 += Double($1.score) } / Double(outputs.count)
+                let expValues = outputs.map { exp(Double($0.score) - mean) }
+                let sumOfExpValues = expValues.reduce(into: 0, +=)
+                // 確率値に補正
+                let probs = outputs.map { exp(Double($0.score) - mean) / sumOfExpValues }
+                self.entropy = -probs.reduce(into: 0) { $0 += $1 * log($1) }
+            }
+            do {
+                self.max_rank = outputs.firstIndex {
+                    answers.contains($0.text)
+                } ?? -1
+            }
+        }
+
+        /// 入力クエリ
+        var query: String
+
+        /// 正解データ（順序無し）
+        var answers: [String]
+
+        /// 出力
+        var outputs: [EvaluateItemOutput]
+
+        /// 文脈
+        var left_context: String
+
+        /// 右文脈
+        var right_context: String
+
+        /// エントロピー
+        var entropy: Double
+
+        /// 正解と判定出来たものの最高の順位（-1は見つからなかったことを示す）
+        var max_rank: Int
+    }
+
+    struct EvaluateItemOutput: Codable {
+        var text: String
+        var score: Double
+    }
+}

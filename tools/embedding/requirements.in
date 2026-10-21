@@ -1,0 +1,6 @@
+torch
+transformers
+coremltools
+safetensors
+numpy
+tokenizers

@@ -1,0 +1,82 @@
+import KanaKanjiConverterModule
+
+public enum ClientAction {
+    case `consume`
+    case `fallthrough`
+    case showCandidateWindow
+    case hideCandidateWindow
+    case appendToMarkedText(String)
+    case appendPieceToMarkedText([InputPiece])
+
+    /// Marked Textを経由せずにインサートするコマンド。InputStateがnoneの場合のみ有効
+    case insertWithoutMarkedText(String)
+    case removeLastMarkedText
+
+    case commitMarkedText
+    /// Shift+←→で選択範囲をエディットするコマンド
+    case editSegment(Int)
+
+    /// previwingに入るコマンド
+    case enterFirstCandidatePreviewMode
+
+    /// スペースを押して`.selecting`に入るコマンド
+    case enterCandidateSelectionMode
+    case submitSelectedCandidate
+    case selectNextCandidate
+    case selectPrevCandidate
+    case selectNumberCandidate(Int)
+
+    case selectInputLanguage(InputLanguage)
+    case commitMarkedTextAndSelectInputLanguage(InputLanguage)
+
+    /// MarkedTextを確定して、さらに追加で入力する
+    case commitMarkedTextAndAppendToMarkedText(String)
+    case commitMarkedTextAndAppendPieceToMarkedText([InputPiece])
+
+    /// デバッグウィンドウを表示するコマンド
+    case enableDebugWindow
+    case disableDebugWindow
+
+    /// 学習のリセット
+    case forgetMemory
+
+    // Fnキーでの変換
+    case submitKatakanaCandidate
+    case submitHiraganaCandidate
+    case submitHankakuKatakanaCandidate
+    case submitFullWidthRomanCandidate
+    case submitHalfWidthRomanCandidate
+
+    // PredictiveSuggestion
+    case requestPredictiveSuggestion
+    case acceptPredictionCandidate
+
+    // ReplaceSuggestion
+    case requestReplaceSuggestion
+    case selectNextReplaceSuggestionCandidate
+    case selectPrevReplaceSuggestionCandidate
+    case submitReplaceSuggestionCandidate
+    case hideReplaceSuggestionWindow
+
+    // Selected Text Transform
+    case showPromptInputWindow
+    case transformSelectedText(String, String)  // (selectedText, prompt)
+
+    // Unicode Input (Shift+Ctrl+U)
+    case enterUnicodeInputMode
+    case appendToUnicodeInput(String)
+    case removeLastUnicodeInput
+    case submitUnicodeInput(String)
+    case cancelUnicodeInput
+    case submitSelectedCandidateAndEnterUnicodeInputMode
+
+    case stopComposition
+}
+
+public enum ClientActionCallback {
+    case `fallthrough`
+    case transition(InputState)
+    ///
+    case basedOnBackspace(ifIsEmpty: InputState, ifIsNotEmpty: InputState)
+    case basedOnSubmitCandidate(ifIsEmpty: InputState, ifIsNotEmpty: InputState)
+}
