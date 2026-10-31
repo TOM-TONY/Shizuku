@@ -32,6 +32,8 @@ struct WindowReadResult: @unchecked Sendable {
     var boundaries: [AXUIElement]
     /// 編集中の欄のカーソルより前。読めなければ nil
     var fieldBefore: String? = nil
+    /// 編集中の欄が空か（欄の文字数。読めなければ nil）
+    var fieldEmpty: Bool? = nil
 }
 
 /// All remote AX work runs on this bounded background queue, never in a key callback.
@@ -125,6 +127,18 @@ enum WindowContextReader {
         return text
     }
 
+    /// 編集中の欄が空か。空白だけ・案内文（placeholder）と同じ文字だけの欄も空とみなす（Electron 製のアプリの空の欄）。
+    /// 読んだ文字は比べるだけで、保存・記録しない。読めなければ nil
+    static func fieldIsEmpty(_ focused: AXUIElement) -> Bool? {
+        guard let count = value(focused, kAXNumberOfCharactersAttribute) as? Int else { return nil }
+        if count == 0 { return true }
+        guard count <= 200, let text = value(focused, kAXValueAttribute) as? String else { return false }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if let placeholder = value(focused, kAXPlaceholderValueAttribute) as? String, !placeholder.isEmpty,
+           text.trimmingCharacters(in: .whitespacesAndNewlines) == placeholder.trimmingCharacters(in: .whitespacesAndNewlines) { return true }
+        return false
+    }
+
     static func read(pid: pid_t) -> WindowReadResult? {
         guard AXIsProcessTrusted() else { return nil }
         let deadline = Date().addingTimeInterval(0.15)
@@ -191,8 +205,9 @@ enum WindowContextReader {
             pending.append(contentsOf: children.prefix(max(0, 512 - visited)).reversed().map { ($0, childClip) })
         }
         let before = Date() < deadline ? fieldBefore(focused) : nil
+        let empty = Date() < deadline ? fieldIsEmpty(focused) : nil
         return .init(identity: String(identity.finalize()), window: window, focused: focused, frame: frame, editing: editing, blocks: blocks,
-                     needsOCR: uncovered || blocks.isEmpty || !pending.isEmpty, boundaries: boundaries, fieldBefore: before)
+                     needsOCR: uncovered || blocks.isEmpty || !pending.isEmpty, boundaries: boundaries, fieldBefore: before, fieldEmpty: empty)
     }
 
     /// Capture only this window. OCR excludes editing and already readable AX text.

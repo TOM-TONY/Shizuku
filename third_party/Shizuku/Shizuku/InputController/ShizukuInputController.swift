@@ -24,7 +24,11 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
     private var inputTraceRequestID: UInt64 = 0
     let converterServerClient = ConverterServerClient()
     private var currentConverterView: ConverterSessionSnapshot?
-    private var hasClientMarkedText = false
+    private var hasClientMarkedText = false {
+        didSet { if !self.hasClientMarkedText { self.clientMarkedString = "" } }
+    }
+    /// アプリに置いている入力中の文字（メモリ上だけ。記録しない）
+    private var clientMarkedString = ""
     private(set) var inputState: InputState = .none
     private var inputLanguage: InputLanguage = .japanese
     private var pendingKeyEventCount = 0
@@ -39,6 +43,11 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
     /// llm-ime: 続き予測を入力中の文字の後ろに薄い灰色で表示するウィンドウと、そのアプリでの文字の大きさ（推定）
     private let ghostUI = DeferredUI<GhostTextWindow>()
     private var ghostTextWindow: GhostTextWindow { self.ghostUI.value { GhostTextWindow() } }
+    /// llm-ime: 手を止めている間に続きを考えているときの肉球
+    private let thinkingUI = DeferredUI<ThinkingCatWindow>()
+    private var thinkingWorkItem: DispatchWorkItem?
+    private var thinkingToken: UInt64 = 0
+    private static let thinkingIndicatorDelay: TimeInterval = 0.25
     /// llm-ime: 続き予測を予測変換の候補のように別ウィンドウで出す（既定。灰色の文字はアプリによって位置がずれるため）
     private let completionUI = DeferredUI<CompletionPopupWindow>()
     private var completionPopupWindow: CompletionPopupWindow { self.completionUI.value { CompletionPopupWindow() } }
@@ -69,6 +78,8 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         /// 折り返す右端（nil なら折り返さない）
         var rightEdge: CGFloat?
         var referenceReceipt: WindowContextReceipt? = nil
+        /// 空の欄の書き出し（次の依頼の予想ができたら置き換える）
+        var fromSkeleton = false
     }
     private var idleCompletion: IdleCompletion?
     private struct PlacedAssistance {
@@ -119,8 +130,12 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
     /// Tab で入れた続き予測の位置（文書の中の UTF-16 の位置）と文字列。少し後にカーソルが末尾にあるか確かめる
     private var pendingCaretCheck: (start: Int, text: String)?
     private var idleCompletionWorkItem: DispatchWorkItem?
-    /// llm-ime: 空の欄の書き出し（骨組みの先出し）を確かめる予約と、押したキーの数（予約の後にキーを押したら出さない）
-    private var skeletonWorkItem: DispatchWorkItem?
+    /// llm-ime: 空の欄で手を止めたときの提案（書き出し・次の依頼）を尋ねる予約と、押したキーの数（予約の後にキーを押したら出さない）。
+    /// 次の依頼を作っている間は、はじめ 1 秒おき、30 回の後は 3 秒おきに尋ね直す（AI の作業が長くても、終わったら出せるように約 15 分まで）
+    private var emptyFieldWorkItem: DispatchWorkItem?
+    private static let emptyFieldPollInterval: TimeInterval = 1
+    private static let emptyFieldSlowPollInterval: TimeInterval = 3
+    private static let emptyFieldPollLimit = 330
     private var keyDownCount: UInt64 = 0
     /// キー入力・確定のたびに進める。古い要求の結果を表示しないため
     private var idleGeneration: UInt64 = 0
@@ -238,12 +253,26 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         let generation = self.activationGeneration
         // A paste can leave an application-owned marked range. Start our composition at
         // the current selection instead of implicitly replacing that unrelated range.
+        // Otherwise keep the range implicit: Chromium clients can report an unknown or stale
+        // selection, and an explicit out-of-range start cancels the composition and the caret.
         let range = length > 0 && !self.hasClientMarkedText && replacementRange.location == NSNotFound
-            ? client.selectedRange() : replacementRange
+            ? ClientTextRange.compositionStart(clientMarked: client.markedRange(), selected: { client.selectedRange() }) : replacementRange
         guard self.activationGeneration == generation else { return }
+        let string = (text as? NSAttributedString)?.string ?? (text as? String) ?? ""
+        // Chromium rewrites only the difference from the previous composition. An insertion in front of an
+        // unchanged tail ("t" -> "っt") desynchronizes ProseMirror fields such as Codex after a paste, so send
+        // the part before that tail first; both updates then change only the end of the composition.
+        if self.hasClientMarkedText, replacementRange.location == NSNotFound,
+           let partial = ClientCompositionUpdate.intermediateLength(from: self.clientMarkedString, to: string) {
+            let head: Any = (text as? NSAttributedString)?.attributedSubstring(from: NSRange(location: 0, length: partial))
+                ?? (string as NSString).substring(to: partial)
+            InputTrace.event(.branch, controller: self.inputTraceID, request: self.inputTraceRequestID, length: partial, reason: .compositionTail)
+            client.setMarkedText(head, selectionRange: NSRange(location: partial, length: 0), replacementRange: range)
+            guard self.activationGeneration == generation else { return }
+        }
         InputTrace.event(.markedCall, controller: self.inputTraceID, request: self.inputTraceRequestID, length: length)
         client.setMarkedText(text, selectionRange: selectionRange, replacementRange: range)
-        if self.activationGeneration == generation { self.hasClientMarkedText = length > 0 }
+        if self.activationGeneration == generation { self.hasClientMarkedText = length > 0; self.clientMarkedString = length > 0 ? string : "" }
         InputTrace.event(.markedReturn, controller: self.inputTraceID, request: self.inputTraceRequestID, length: length)
     }
 
@@ -401,7 +430,7 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
             self.converterServerClient.sendUnordered({ _ in .windowContext(binding) }) { _ in }
         }
         self.startInputModeTracking()
-        self.scheduleSkeleton()
+        self.scheduleEmptyFieldSuggestion()
     }
 
     @MainActor
@@ -411,6 +440,7 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         self.activationSetupWorkItem?.cancel()
         self.activationSetupWorkItem = nil
         self.activationSetupPending = false
+        self.endThinking()
         self.placedAssistance = nil; self.assistanceUndo = nil
         self.placedPresentationVersion &+= 1; self.placedPresentationPending = false
         self.dismissedAssistance.removeAll(); self.tabTracker.reset(); self.observingPassedTab = false
@@ -429,7 +459,7 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         self.replaceSuggestionsUI.loaded?.window.orderOut(nil)
         self.hideCompletionDisplay()
         self.idleCompletionWorkItem?.cancel()
-        self.skeletonWorkItem?.cancel()
+        self.emptyFieldWorkItem?.cancel()
         self.idleCompletion = nil
         self.candidatesUI.loaded?.controller.updateCandidatePresentations([], selectionIndex: nil, cursorLocation: .zero)
         super.deactivateServer(sender)
@@ -449,9 +479,31 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
                 guard let self else { InputTrace.event(.guardReturn, controller: traceID, reason: .ownerReleased); return }
                 guard self.activationGeneration == activationGeneration else { self.traceGuard(.staleActivation); return }
                 guard let response else { self.traceGuard(.noResponse); return }
-                self.apply(response)
+                self.apply(self.reconcilingClientCommit(response))
             }
         })
+    }
+
+    /// アプリが入力中の文字を自分で確定してから commitComposition を呼んだとき（Slack などの空の欄の最初の文字）、
+    /// 同じ文字列を挿入し直さない。確定する文字列が違えば（読みの「n」を「ん」で確定するなど）、アプリが確定した部分を置き換える
+    @MainActor private func reconcilingClientCommit(_ response: ConverterServerResponse) -> ConverterServerResponse {
+        guard self.inputState == .composing || self.inputState == .replaceSuggestion, let client = self.client() else { return response }
+        let marked = self.currentMarkedText().elements.map(\.content).joined()
+        guard ClientCompositionCommit.committedByClient(markedText: marked, clientMarkedRange: client.markedRange(),
+                                                        leftContext: self.getLeftSideContext(maxCount: 100)) else { return response }
+        InputTrace.event(.branch, controller: self.inputTraceID, length: (marked as NSString).length, reason: .clientCommitted)
+        // アプリにはもう入力中の範囲がない。空の入力中の文字を送り直さない
+        self.hasClientMarkedText = false
+        let caret = client.selectedRange().location
+        var reconciled = response
+        reconciled.effects = []
+        for effect in response.effects {
+            guard case .insertText(let text) = effect else { reconciled.effects.append(effect); continue }
+            if let range = ClientCompositionCommit.replacementRange(committing: text, markedText: marked, caret: caret) {
+                self.insertClientText(text, replacementRange: range, client: client)
+            }
+        }
+        return reconciled
     }
 
     // MARK: - setValue: 状態同期のみ
@@ -522,16 +574,18 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         guard let event else { self.traceGuard(.noEvent); return false }
         guard let client = sender as? IMKTextInput else { self.traceGuard(.noClient); return false }
         guard event.type == .keyDown else { self.traceGuard(.notKeyDown); return false }
+        // 打ち始めたら、考えている印は消す
+        self.endThinking()
         if let consumed = self.handleAssistanceVerb(event: event, client: client) {
             InputTrace.event(.branch, controller: self.inputTraceID, reason: .assistanceVerb, number: consumed ? 1 : 0)
             return consumed
         }
-        // llm-ime: 空の欄の書き出しは、キーを押したら出さない。何も入力していない状態の Enter（送信）の後は、欄が空になっていれば出す
+        // llm-ime: 空の欄での提案（書き出し・次の依頼）は、キーを押したら出さない。何も入力していない状態の Enter（送信）の後は、欄が空になっていれば出す
         self.keyDownCount &+= 1
-        self.skeletonWorkItem?.cancel()
+        self.emptyFieldWorkItem?.cancel()
         if event.keyCode == 36, self.inputState == .none,
            event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty {
-            self.scheduleSkeleton()
+            self.scheduleEmptyFieldSuggestion()
         }
 
         // llm-ime: 場面に合わせた入力モード。入力欄に入ってから最初に文字を打ったときのモードを送る
@@ -1422,8 +1476,11 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
     private func requestDraftSentence(_ current: IdleCompletion, round: Int, generation: UInt64) {
         let activationGeneration = self.activationGeneration
         let context = current.leftContext + current.text
+        // 最初の 1 文を考えている間だけ、カーソルの右に肉球を出す（2 文目からは灰色の文字が出ている）
+        let thinking = round == 0 ? self.beginThinking(caretX: current.caretX, lineRect: current.lineRect) : nil
         self.converterServerClient.sendUnordered({ _ in .completion(.draft(leftContext: context)) }) { [weak self] response in
             Task { @MainActor in
+                if let thinking { self?.endThinking(thinking) }
                 guard let self, self.idleGeneration == generation, self.activationGeneration == activationGeneration,
                       self.inputState == .none, self.placedAssistance == nil,
                       let sentence = response?.snapshot.nextTextCompletion, !sentence.isEmpty else {
@@ -1807,7 +1864,7 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         let hash = AssistanceVerbs.fingerprint(text)
         self.dismissedAssistance.insert(hash)
         self.recordAssistanceVerb("verb_esc", hash: hash)
-        self.idleGeneration &+= 1; self.idleCompletionWorkItem?.cancel(); self.skeletonWorkItem?.cancel()
+        self.idleGeneration &+= 1; self.idleCompletionWorkItem?.cancel(); self.emptyFieldWorkItem?.cancel()
     }
 
     @MainActor private func showPlacedAssistance(client: IMKTextInput, selectionOffset: Int? = nil) {
@@ -2190,76 +2247,157 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         Self.ghostLog.notice("caret fix: re-inserted the last \(newlines) units after the caret to move it to the end")
     }
 
-    /// llm-ime: 空の欄の書き出し（文の骨組みの先出し）。入力欄に入った・何も入力していない状態で Enter（送信）を押した後、
-    /// 待ち時間が過ぎてもキーを押しておらず、入力中の文字も続き予測もなく、欄が空なら、その場面のいつもの書き出しを Server に尋ねて
-    /// 灰色で出す（Tab で入れる）。場面学習と「放置で続きを自動生成」がオンのときだけ。出すかどうか（記録が足りるか）は Server が決める
-    @MainActor private func scheduleSkeleton() {
-        self.skeletonWorkItem?.cancel()
-        guard Config.PersonalLearning().value, Self.isIdleCompletionEnabled else {
+    /// llm-ime: 空の欄で手を止めたときの提案（「放置時に本文を生成」の、まだ何も書いていない欄の場合）。入力欄に入った・
+    /// 何も入力していない状態で Enter（送信）を押した後、待ち時間が過ぎてもキーを押しておらず欄が空なら、Server に尋ねて灰色で出す
+    /// （Tab で入れる）。AI との会話では画面の最後の返答から作った次の依頼、それ以外はその場面のいつもの書き出し（Server が選ぶ）。
+    /// 次の依頼を作っている間（AI が返答を書いている間も）は間を置いて尋ね直し、書き出しを出していれば次の依頼で置き換える
+    @MainActor private func scheduleEmptyFieldSuggestion(round: Int = 0) {
+        self.emptyFieldWorkItem?.cancel()
+        guard Self.isEmptyFieldSuggestionEnabled, round < Self.emptyFieldPollLimit else {
             return
+        }
+        if round == 0 {
+            self.lastNextPromptNote = nil
+            self.noteNextPrompt("armed")
         }
         let generation = self.activationGeneration
         let keys = self.keyDownCount
+        let stillIdle = { [weak self] () -> Bool in
+            guard let self else { return false }
+            return self.activationGeneration == generation && self.keyDownCount == keys && self.inputState == .none
+                && self.placedAssistance == nil && (self.idleCompletion.map(\.fromSkeleton) ?? true)
+        }
         let item = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.activationGeneration == generation, self.keyDownCount == keys, self.inputState == .none,
-                      self.pendingKeyEventCount == 0, self.idleCompletion == nil, Self.isIdleCompletionEnabled, Config.PersonalLearning().value,
-                      let client = self.client(), client.length() == 0 else {
+                guard let self, stillIdle(), self.pendingKeyEventCount == 0, Self.isEmptyFieldSuggestionEnabled,
+                      let client = self.client(), let field = self.emptyField(client: client) else {
                     return
                 }
-                // 欄の長さをいつも 0 と返すアプリがあるので、カーソルの前が空と分かり、欄の最初の 1 文字もないときだけ空とみなす
-                var actual = NSRange()
-                guard client.string(from: NSRange(location: 0, length: 0), actualRange: &actual) == "",
-                      (client.string(from: NSRange(location: 0, length: 1), actualRange: &actual) ?? "").isEmpty else {
-                    return
-                }
-                var rect: NSRect = .zero
-                client.attributes(forCharacterIndex: 0, lineHeightRectangle: &rect)
-                // 空の欄では、初期化されていない・0 の矩形を返すアプリがある。画面の中で、入力先のアプリのウィンドウの中にあるときだけ出す
-                let caret = NSPoint(x: rect.minX, y: rect.midY)
-                guard PersonalOpening.isUsableAnchor(
-                    rect, screens: NSScreen.screens.map(\.frame), clientWindow: self.clientWindowFrame(containing: caret, clientOnly: true)
-                ) else {
-                    Self.ghostLog.notice("skeleton: caret rect rejected: \(NSStringFromRect(rect), privacy: .public)")
-                    return
-                }
-                let observation = ConverterSceneObservation(
-                    bundleID: self.ghostClientBundleID,
-                    previousBundleID: ApplicationActivationTracker.shared.previousApplication(before: self.ghostClientBundleID),
-                    documentLength: 0,
-                    startedEmpty: true,
-                    monospaced: self.lastFontIsFixedPitch,
-                    backspacesAfterCommit: 0
-                )
-                self.converterServerClient.sendUnordered({ _ in .completion(.skeleton(scene: observation)) }) { [weak self] response in
+                // 欄の長さを返さないアプリ（Electron 製など）では、空かどうかを Server が画面の読み取りで確かめる
+                let observation = self.emptyFieldObservation(documentLength: field.known ? 0 : nil)
+                // 書き出しをまだ出していなければ、考えている間は欄の先頭に肉球を出す
+                let thinking = self.idleCompletion == nil ? field.rect.map { self.beginThinking(caretX: $0.minX, lineRect: $0) } : nil
+                self.converterServerClient.sendUnordered({ _ in .completion(.nextPrompt(scene: observation, round: round)) }) { [weak self] response in
                     Task { @MainActor in
-                        guard let self, self.activationGeneration == generation, self.keyDownCount == keys, self.inputState == .none,
-                              self.idleCompletion == nil, let text = response?.snapshot.nextTextCompletion, !text.isEmpty else {
+                        if let thinking { self?.endThinking(thinking) }
+                        guard let self, stillIdle() else { return }
+                        let pending = response?.nextPromptPending == true
+                        if let text = response?.snapshot.nextTextCompletion, !text.isEmpty, self.idleCompletion?.text != text {
+                            let fromScreen = response?.windowReferenceUsed == true
+                            // 空の欄の位置を返さないアプリでは、画面の読み取りから求めた欄の位置に出す
+                            if let rect = field.rect ?? self.usableEmptyFieldAnchor(response?.emptyFieldLineRect) {
+                                self.noteNextPrompt("shown \(fromScreen ? "next prompt" : "opening") (round \(round), \(text.count) characters)")
+                                self.showEmptyFieldSuggestion(text, rect: rect, fromSkeleton: !fromScreen, hint: fromScreen ? "Tab・画面" : "Tab")
+                            } else {
+                                self.noteNextPrompt("no place to show")
+                            }
+                            if fromScreen { return }
+                        }
+                        guard pending else {
+                            if response == nil { self.noteNextPrompt("no response") }
                             return
                         }
-                        guard !self.dismissedAssistance.contains(AssistanceVerbs.fingerprint(text)) else { return }
-                        // 空の欄では文字の大きさが分からないので、行の高さから見積もる
-                        let fontSize = max(10, min(rect.height / 1.25, 28))
-                        let layout = self.ghostLayout(caret: NSPoint(x: rect.minX, y: rect.midY), currentLine: "", fontSize: fontSize)
-                        let skeleton = IdleCompletion(
-                            text: text, leftContext: "", caretX: rect.minX, lineRect: rect, fontSize: fontSize,
-                            lineStartX: layout.lineStartX, rightEdge: layout.rightEdge
-                        )
-                        self.idleCompletion = skeleton
-                        if Config.NextTextCompletionInlineGhost().value {
-                            self.ghostTextWindow.show(
-                                text: skeleton.text, caretX: skeleton.caretX, lineRect: skeleton.lineRect, lineStartX: skeleton.lineStartX,
-                                fontSize: skeleton.fontSize, rightEdge: skeleton.rightEdge
-                            )
-                        } else {
-                            self.completionPopupWindow.show(text: skeleton.text, lineRect: skeleton.lineRect, avoiding: self.otherIMEWindows)
-                        }
+                        self.noteNextPrompt("waiting for next prompt")
+                        self.scheduleEmptyFieldSuggestion(round: round + 1)
                     }
                 }
             }
         }
-        self.skeletonWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + (self.tunedIdleCompletionDelay ?? Self.idleCompletionDelay), execute: item)
+        self.emptyFieldWorkItem = item
+        let delay = round == 0 ? (self.tunedIdleCompletionDelay ?? Self.idleCompletionDelay)
+            : round < 30 ? Self.emptyFieldPollInterval : Self.emptyFieldSlowPollInterval
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private var lastNextPromptNote: String?
+    /// 空の欄での提案の診断の記録（理由と文字数だけ）。同じ理由は続けて書かない
+    private func noteNextPrompt(_ message: String) {
+        guard message != self.lastNextPromptNote else { return }
+        self.lastNextPromptNote = message
+        Self.ghostLog.notice("next prompt: \(message, privacy: .public)")
+    }
+
+    /// 空の欄で手を止めたときに提案するか（放置時に本文を生成がオンで、場面学習か次の依頼の予想が使える）
+    static var isEmptyFieldSuggestionEnabled: Bool {
+        Self.isIdleCompletionEnabled && (Config.PersonalLearning().value || Self.isNextPromptEnabled)
+    }
+
+    /// 次の依頼の予想を使うか（「放置時に本文を生成」の中の設定と、ウィンドウの参照の両方がオン）
+    static var isNextPromptEnabled: Bool {
+        Config.NextPromptSuggestion().value && Config.WindowContextEnabled().value
+    }
+
+    /// 欄が空（か、空かどうかアプリが答えない）なら、欄の先頭の行の矩形と、空だとアプリから確かめられたか。
+    /// 文字があると分かれば nil。rect はアプリが使える位置を返さなければ nil
+    @MainActor private func emptyField(client: IMKTextInput) -> (rect: NSRect?, known: Bool)? {
+        let length = client.length()
+        var known = true
+        // 長さを返さないアプリは NSNotFound か 32 ビットの最大値を返す
+        if length == NSNotFound || length >= Int(Int32.max) {
+            known = false
+        } else if length != 0 {
+            self.noteNextPrompt("field length \(length)")
+            return nil
+        }
+        // 欄の長さをいつも 0 と返すアプリがあるので、カーソルの前が空と分かり、欄の最初の 1 文字もないときだけ空とみなす。
+        // カーソルの前を読めないアプリ（Electron 製など）は、空かどうかを Server に任せる
+        var actual = NSRange()
+        let before = client.string(from: NSRange(location: 0, length: 0), actualRange: &actual)
+        let first = client.string(from: NSRange(location: 0, length: 1), actualRange: &actual)
+        if before == nil {
+            known = false
+        } else if before != "" || !(first ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.noteNextPrompt("field has text")
+            return nil
+        }
+        var rect: NSRect = .zero
+        client.attributes(forCharacterIndex: 0, lineHeightRectangle: &rect)
+        return (self.usableEmptyFieldAnchor(rect), known)
+    }
+
+    /// 空の欄では、初期化されていない・0 の矩形を返すアプリがある。画面の中で、入力先のアプリのウィンドウの中にあるときだけ使う
+    @MainActor private func usableEmptyFieldAnchor(_ rect: NSRect?) -> NSRect? {
+        guard let rect else { return nil }
+        let caret = NSPoint(x: rect.minX, y: rect.midY)
+        guard PersonalOpening.isUsableAnchor(
+            rect, screens: NSScreen.screens.map(\.frame), clientWindow: self.clientWindowFrame(containing: caret, clientOnly: true)
+        ) else {
+            self.noteNextPrompt("caret rect rejected: \(NSStringFromRect(rect))")
+            return nil
+        }
+        return rect
+    }
+
+    @MainActor private func emptyFieldObservation(documentLength: Int?) -> ConverterSceneObservation {
+        ConverterSceneObservation(
+            bundleID: self.ghostClientBundleID,
+            previousBundleID: ApplicationActivationTracker.shared.previousApplication(before: self.ghostClientBundleID),
+            documentLength: documentLength,
+            startedEmpty: true,
+            monospaced: self.lastFontIsFixedPitch,
+            backspacesAfterCommit: 0
+        )
+    }
+
+    /// 空の欄に、書き出し・次の依頼を灰色で出す（Tab で入れる）
+    @MainActor private func showEmptyFieldSuggestion(_ text: String, rect: NSRect, fromSkeleton: Bool, hint: String = "Tab") {
+        guard !self.dismissedAssistance.contains(AssistanceVerbs.fingerprint(text)) else { return }
+        // 空の欄では文字の大きさが分からないので、行の高さから見積もる
+        let fontSize = max(10, min(rect.height / 1.25, 28))
+        let layout = self.ghostLayout(caret: NSPoint(x: rect.minX, y: rect.midY), currentLine: "", fontSize: fontSize)
+        let suggestion = IdleCompletion(
+            text: text, leftContext: "", caretX: rect.minX, lineRect: rect, fontSize: fontSize,
+            lineStartX: layout.lineStartX, rightEdge: layout.rightEdge, fromSkeleton: fromSkeleton
+        )
+        self.idleCompletion = suggestion
+        if Config.NextTextCompletionInlineGhost().value {
+            self.ghostTextWindow.show(
+                text: suggestion.text, caretX: suggestion.caretX, lineRect: suggestion.lineRect, lineStartX: suggestion.lineStartX,
+                fontSize: suggestion.fontSize, rightEdge: suggestion.rightEdge
+            )
+        } else {
+            self.completionPopupWindow.show(text: suggestion.text, lineRect: suggestion.lineRect, avoiding: self.otherIMEWindows, hint: hint)
+        }
     }
 
     /// llm-ime: 放置で続きを自動生成するか（続き予測と、その中の「放置で自動生成」の両方がオン）
@@ -2273,6 +2411,33 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         self.idleGeneration &+= 1
         self.idleCompletion = nil
         self.hideCompletionDisplay()
+        self.endThinking()
+    }
+
+    /// llm-ime: 手を止めている間の生成を待つ間、カーソルの右に肉球を出す（少し待ってから。すぐ返る応答では出さない）。
+    /// 返した番号を endThinking に渡すと、その要求の印だけを消す（後から始めた要求の印は残す）
+    @MainActor private func beginThinking(caretX: CGFloat, lineRect: NSRect) -> UInt64 {
+        self.endThinking()
+        let token = self.thinkingToken
+        guard lineRect.height > 0 else { return token }
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.thinkingToken == token, self.inputState == .none, self.pendingKeyEventCount == 0 else { return }
+                self.thinkingUI.value { ThinkingCatWindow() }.show(caretX: caretX, lineRect: lineRect)
+            }
+        }
+        self.thinkingWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.thinkingIndicatorDelay, execute: item)
+        return token
+    }
+
+    /// 肉球を消す。token を渡したら、それが今の印のときだけ
+    private func endThinking(_ token: UInt64? = nil) {
+        guard token.map({ $0 == self.thinkingToken }) ?? true else { return }
+        self.thinkingToken &+= 1
+        self.thinkingWorkItem?.cancel()
+        self.thinkingWorkItem = nil
+        self.thinkingUI.loaded?.hide()
     }
 
     /// llm-ime: 続き予測の表示（別ウィンドウ・灰色の文字の両方）を消す

@@ -17,6 +17,7 @@ enum InputTrace {
         case languagePrompt = "language_prompt", promptVisible = "prompt_visible", backendOff = "backend_off", selectedPrompt = "selected_prompt"
         case routerApplication = "router_application", ownerReleased = "owner_released", staleActivation = "stale_activation"
         case noResponse = "no_response", delayedFallthrough = "delayed_fallthrough", staleCompletion = "stale_completion"
+        case clientCommitted = "client_committed", compositionTail = "composition_tail"
         case noSession = "no_session", reconnectWait = "reconnect_wait", retry, connect, interrupted, invalidated, proxyError = "proxy_error", noProxy = "no_proxy"
         case remoteError = "remote_error", noData = "no_data", encodeError = "encode_error", decodeError = "decode_error", timeout
         case objcUncaught = "objc_uncaught"

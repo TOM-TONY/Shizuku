@@ -127,3 +127,81 @@ private struct FixedEmbedder: WindowTextEmbedder {
     #expect(LocalLLMPrompts.suggestionUserPrompt(leftContext: "", target: "りょうかい", style: "", reference: "") == magic)
     #expect(LocalLLMPrompts.suggestionUserPrompt(leftContext: "", target: "りょうかい", style: "", reference: "明日来られますか").contains("明日来られますか"))
 }
+
+// llm-ime: 次の依頼の予想（返信先から、本人が次に AI へ送りそうな 1 文）
+
+@Test func nextPromptSourceTakesTheReplyAndTheConversationAboveIt() {
+    let editing = CGRect(x: 100, y: 800, width: 400, height: 40)
+    let reference = WindowReference(identity: "codex", capturedAt: 0, blocks: [
+        .init(text: "モデル3のトークンページを開いて", rect: CGRect(x: 300, y: 100, width: 200, height: 20), role: "AXStaticText"),
+        .init(text: "トークン設定ページを開きました。本人確認画面が出ているので、パスワードを入力してください。", rect: CGRect(x: 100, y: 300, width: 400, height: 40), role: "AXStaticText"),
+        .init(text: "サイドバーの項目", rect: CGRect(x: 0, y: 500, width: 50, height: 20), role: "AXStaticText"),
+        .init(text: "下に表示される注意書きです", rect: CGRect(x: 100, y: 900, width: 400, height: 20), role: "AXStaticText"),
+    ], editing: editing)
+    let source = NextPrompt.source(reference, terminal: false)
+    #expect(source?.reply == "トークン設定ページを開きました。本人確認画面が出ているので、パスワードを入力してください。")
+    #expect(source?.earlier == "モデル3のトークンページを開いて")
+    #expect(NextPrompt.source(WindowReference(identity: "x", capturedAt: 0, blocks: reference.blocks), terminal: false) == nil)
+}
+
+@Test func nextPromptSourceInTerminalsIsTheLastBlockBeforeThePrompt() {
+    let blocks = WindowReference.terminalBlocks(fieldBefore: "$ claude\n> テストを直して\n\n直しました。全部のテストが通りました。\n> ")
+    let source = NextPrompt.source(WindowReference(identity: "t", capturedAt: 0, blocks: blocks), terminal: true)
+    #expect(source?.reply == "直しました。全部のテストが通りました。")
+    #expect(source?.earlier.contains("テストを直して") == true)
+}
+
+@Test func nextPromptWaitsUntilTheReplyStopsChanging() {
+    var stability = NextPrompt.Stability()
+    let observed = [(1, 0.0), (1, 1.0), (2, 2.0), (2, 3.0), (2, 3.5)].map { stability.observe($0.0, now: $0.1) }
+    // 返答が変わっている間（まだ書いている）は作らず、同じまま 1.5 秒続いたら作る
+    #expect(observed == [false, false, false, false, true])
+}
+
+@Test func nextPromptOutputIsOneCleanRequest() {
+    #expect(NextPrompt.clean("次の依頼：「認証したので、トークンの設定を進めてくれる？」\n説明: ...") == "認証したので、トークンの設定を進めてくれる？")
+    #expect(NextPrompt.clean("\n- テストも追加して\n") == "テストも追加して")
+    #expect(NextPrompt.clean("   ") == nil)
+    #expect(NextPrompt.clean(String(repeating: "長", count: NextPrompt.maximumLength + 1)) == nil)
+}
+
+@Test func nextPromptRejectsInventedNumbersAndCopies() {
+    let blocks: [WindowReferenceBlock] = [.init(text: "モデル3のページを開きました。パスワードを入力して確認を押してください。", role: "AXTerminal")]
+    let source = NextPrompt.source(WindowReference(identity: "t", capturedAt: 0, blocks: blocks), terminal: true)!
+    #expect(NextPrompt.permits("認証したので、モデル3のトークン設定を進めてくれる？", source: source))
+    #expect(!NextPrompt.permits("モデル4のトークンを作って", source: source))
+    #expect(!NextPrompt.permits("パスワードを入力して確認を押してください。", source: source))
+    let prompt = NextPrompt.userPrompt(source, examples: ["これ進めてくれる？"])
+    #expect(prompt.contains("モデル3のページを開きました"))
+    #expect(prompt.contains("- これ進めてくれる？"))
+}
+
+@Test func nextPromptPrefersTheAccessibilityReplyOverOCRText() {
+    let editing = CGRect(x: 100, y: 800, width: 400, height: 40)
+    let reply = WindowReferenceBlock(text: "トークン設定ページを開きました。確認してください。", rect: CGRect(x: 100, y: 600, width: 400, height: 40),
+                                     source: .accessibility, role: "AXStaticText")
+    let label = WindowReferenceBlock(text: "作業しました", rect: CGRect(x: 100, y: 700, width: 200, height: 20), source: .ocr)
+    let axOnly = WindowReference(identity: "codex", capturedAt: 0, blocks: [reply], editing: editing)
+    let withOCR = WindowReference(identity: "codex", capturedAt: 0, blocks: [reply, label], editing: editing, fieldEmpty: true)
+    // 文字認識を足した後も返信先が変わらない（変わると、落ち着くのを待ち続けて生成が始まらない）
+    #expect(NextPrompt.source(axOnly, terminal: false)?.fingerprint == NextPrompt.source(withOCR, terminal: false)?.fingerprint)
+    #expect(withOCR.replyTarget?.text == "作業しました")
+    #expect(withOCR.fieldEmpty == true && axOnly.fieldEmpty == nil)
+}
+
+@Test func nextPromptSkipsShortWorkLabelsAndMatchesTheSameReplyAcrossReads() {
+    let editing = CGRect(x: 100, y: 800, width: 400, height: 40)
+    let reply = WindowReferenceBlock(text: "こんにちは！今日は何をしましょうか？", rect: CGRect(x: 100, y: 600, width: 400, height: 20),
+                                     source: .ocr, role: nil)
+    let label = WindowReferenceBlock(text: "10s間作業しました", rect: CGRect(x: 100, y: 700, width: 200, height: 20), source: .accessibility)
+    let reference = WindowReference(identity: "codex", capturedAt: 0, blocks: [reply, label], editing: editing)
+    // 「作業しました」などの短いラベルより、文の長さの本文を返信先にする
+    #expect(NextPrompt.source(reference, terminal: false)?.reply == "こんにちは！今日は何をしましょうか？")
+    // 空白の入り方が違う読み取りでも、同じ返答がまだ画面にあると分かる
+    let reread = WindowReference(identity: "codex", capturedAt: 1, blocks: [
+        .init(text: "こんにちは！ 今日は何をしましょうか？", rect: CGRect(x: 100, y: 600, width: 400, height: 20), source: .accessibility),
+    ], editing: editing)
+    #expect(NextPrompt.isShown("こんにちは！今日は何をしましょうか？", in: reread))
+    #expect(!NextPrompt.isShown("別の返答です。テストを追加しました。", in: reread))
+    #expect(NextPrompt.related("今日は何をしましょうか？", "こんにちは！今日は何をしましょうか？"))
+}

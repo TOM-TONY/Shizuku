@@ -41,6 +41,11 @@ public final class SegmentsManager {
     }
     /// llm-ime: 個人化（場面学習）。nil なら何もしない（従来どおりの変換）
     public weak var personalization: (any SegmentsManagerPersonalization)?
+    /// llm-ime: 入力欄の前の文章に書いた漢字の語を、今の読みで読めれば候補に足す（DocumentReadings）
+    public var documentReadingsEnabled = true
+    private var documentReadings = DocumentReadings()
+    private var documentReadingLookupScheduled = false
+    private var importedDocumentEntries: [DocumentReadings.Entry] = []
     private var kanaKanjiConverter: KanaKanjiConverter
     private let applicationDirectoryURL: URL
     private let containerURL: URL?
@@ -611,7 +616,7 @@ public final class SegmentsManager {
                 .init(word: DateTemplateLiteral(format: "aK時mm分", type: .western, language: .japanese, delta: "0", deltaUnit: 1).export(), ruby: "イマ", cid: CIDData.固有名詞.cid, mid: MIDData.一般.mid, value: -18.2)
             ]
 
-        self.kanaKanjiConverter.importDynamicUserDictionary([], shortcuts: dynamicShortcuts)
+        self.kanaKanjiConverter.importDynamicUserDictionary(self.prepareDocumentReadings(), shortcuts: dynamicShortcuts)
 
         let leftSideContext = forcedLeftSideContext ?? self.getCleanLeftSideContext(maxCount: ContextLength.conversion)
         let rightSideContext = forcedRightSideContext ?? self.getCleanRightSideContext(maxCount: ContextLength.conversion)
@@ -633,9 +638,112 @@ public final class SegmentsManager {
             raw.mainResults = reference.promoteGlossary(reference.rerank(raw.mainResults, whole: whole), whole: whole)
             self.rawCandidates = raw
         }
+        if var raw = self.rawCandidates {
+            raw.mainResults = self.promotingDocumentSurfaces(raw.mainResults, composingText: self.composingText)
+            self.rawCandidates = raw
+        }
         if let raw = self.rawCandidates, let preferred = self.applyingPersonalPreference(to: raw, composingText: self.composingText) {
             self.rawCandidates = preferred
         }
+    }
+
+    // MARK: - 同じ入力欄に書いた表記を先頭に（llm-ime）
+    //
+    // カーソルより前の文章（Client が送る左文脈）に、読み全体の候補と同じ表記があれば先頭に置く（DocumentGlossary）。
+    // 場面学習で覚えた表記はこの後で先頭に置くので、本人が選び直した表記のほうが優先される
+    @MainActor private func promotingDocumentSurfaces(_ candidates: [Candidate], composingText text: ComposingText) -> [Candidate] {
+        guard !self.didExperienceSegmentEdition,
+              let document = self.delegate?.getLeftSideContext(maxCount: ContextLength.completion), !document.isEmpty else {
+            return candidates
+        }
+        let reading = text.convertTarget.toKatakana()
+        return DocumentGlossary.promote(candidates, document: document) {
+            text.isWholeComposingText(composingCount: $0.composingCount) && $0.data.map(\.ruby).joined() == reading
+        }
+    }
+
+    // MARK: - 前の文章の漢字の語を候補に足す（llm-ime）
+    //
+    // 辞書にその読みがない語（「船底」を「せんてい」で）も、前の文章に書いてあり、1 字ずつの読みが辞書で確かめられれば、
+    // 動的ユーザー辞書の語として変換に渡す。キーの処理では覚えている読みだけを使い、足りない読みは裏で引く（DocumentReadingLookup）
+
+    /// 足す語のコスト（辞書の一般の語と同じくらい）。まれな読みを使う語ほど低くする
+    static func documentWordValue(rank: Int) -> PValue {
+        PValue(-11 - 0.1 * Float(min(rank, 40)))
+    }
+
+    @MainActor private func prepareDocumentReadings() -> [DicdataElement] {
+        if self.documentReadingsEnabled,
+           let document = self.delegate?.getLeftSideContext(maxCount: ContextLength.completion), !document.isEmpty {
+            self.documentReadings.update(document: document)
+            self.documentReadings.match(target: self.composingText.convertTarget.toKatakana())
+            self.scheduleDocumentReadingLookup()
+        } else {
+            self.documentReadings.clear()
+        }
+        // 同じ読みの変換は前の結果を使い回すので、足す語が変わったときだけ、変換の途中の結果を捨てる
+        if self.documentReadings.entries != self.importedDocumentEntries {
+            self.importedDocumentEntries = self.documentReadings.entries
+            self.kanaKanjiConverter.stopComposition()
+        }
+        return self.documentReadings.entries.map {
+            DicdataElement(word: $0.surface, ruby: $0.ruby, cid: CIDData.一般名詞.cid, mid: MIDData.一般.mid,
+                           value: Self.documentWordValue(rank: $0.rank))
+        }
+    }
+
+    /// 足りない読みを 1 つずつ裏で引く。結果は主スレッドで覚え、今の読みの全部の部分で語を探し直す（次の変換から使う）
+    @MainActor private func scheduleDocumentReadingLookup() {
+        guard self.documentReadingsEnabled, !self.documentReadingLookupScheduled, let part = self.documentReadings.pending.first else {
+            return
+        }
+        self.documentReadingLookupScheduled = true
+        // 結果は主スレッドでだけ使う。裏のキューは SegmentsManager に触れない
+        let owner = DocumentReadingOwner(manager: self)
+        DocumentReadingLookup.shared.lookUp(part) { characters in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self = owner.manager else {
+                        return
+                    }
+                    self.documentReadingLookupScheduled = false
+                    self.applyDocumentReading(part, characters)
+                    if !self.composingText.isEmpty {
+                        self.scheduleDocumentReadingLookup()
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor private func applyDocumentReading(_ part: String, _ characters: [Character]) {
+        self.documentReadings.complete(part, characters)
+        if self.documentReadings.match(target: self.composingText.convertTarget.toKatakana(), allSubstrings: true) {
+            self.refinedFirstCandidate = nil
+        }
+    }
+
+    /// 試験・計測用: 足りない読みをすべてその場で引く
+    @MainActor func resolveDocumentReadingsNow() {
+        while self.resolveDocumentReadingsStep() != nil {}
+    }
+
+    /// 試験・計測用: 1 回分を、引く時間（裏のキュー）と覚える時間（主スレッド）に分けて行う
+    @MainActor @discardableResult
+    func resolveDocumentReadingsStep() -> (part: String, lookupMs: Double, applyMs: Double)? {
+        guard let part = self.documentReadings.pending.first else {
+            return nil
+        }
+        let start = Date()
+        let characters = DocumentReadingLookup.shared.lookUpNow(part)
+        let looked = Date()
+        self.applyDocumentReading(part, characters)
+        return (part, looked.timeIntervalSince(start) * 1000, Date().timeIntervalSince(looked) * 1000)
+    }
+
+    /// 計測用: 辞書を引いた回数・残り・見つけた語
+    public var documentReadingStatistics: (lookups: Int, pending: Int, entries: [DocumentReadings.Entry]) {
+        (self.documentReadings.lookups, self.documentReadings.pending.count, self.documentReadings.entries)
     }
 
     // MARK: - 場面学習で覚えた表記を先頭に（llm-ime）
@@ -1388,6 +1496,7 @@ public final class SegmentsManager {
             }
             result.mainResults = reference.promoteGlossary(reference.rerank(result.mainResults, whole: whole), whole: whole)
         }
+        result.mainResults = self.promotingDocumentSurfaces(result.mainResults, composingText: text)
         if let preferred = self.applyingPersonalPreference(to: result, composingText: text) {
             result = preferred
         }
@@ -1801,6 +1910,12 @@ public final class SegmentsManager {
             )
         }
     }
+}
+
+/// llm-ime: 裏のキューの完了を主スレッドの SegmentsManager に渡すための弱い参照（主スレッドでだけ取り出す）
+private final class DocumentReadingOwner: @unchecked Sendable {
+    weak var manager: SegmentsManager?
+    init(manager: SegmentsManager) { self.manager = manager }
 }
 
 public protocol SegmentManagerDelegate: AnyObject {

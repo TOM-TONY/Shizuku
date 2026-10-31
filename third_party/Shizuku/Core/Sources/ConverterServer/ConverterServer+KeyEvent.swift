@@ -12,6 +12,7 @@ extension ConverterServer {
         let session = try getSession(sessionID)
         if let app = request.scene?.bundleID { session.activeAppID = app }
         WindowContextService.shared.prepare(request.context.windowBinding, session: session)
+        WindowContextService.shared.noteKey()
         if request.eventID == session.lastHandledKeyEventID,
            let response = session.lastKeyEventResponse {
             let muted = PersonalSensing.shared.microphoneActive
@@ -659,7 +660,11 @@ extension ConverterServer {
                 reference: reference
             )
             guard session.lastHandledKeyEventID == inputID, await WindowContextService.shared.isCurrent(session, generation: referenceGeneration) else { return .init(snapshot: .empty) }
-            let sentence = rawSentence.map { PersonalLearner.shared.normalizedGeneratedText($0, scene: session.personal.scene, route: .draft) }
+            let singleLine = session.personal.scene.map { $0.shape == .line || $0.aiDirected } ?? false
+            let sentence = rawSentence.map {
+                AssistanceVerbs.inlineContinuation(PersonalLearner.shared.normalizedGeneratedText($0, scene: session.personal.scene, route: .draft),
+                                                   left: leftContext, singleLine: singleLine)
+            }
             if let sentence, !sentence.isEmpty, !PersonalSensing.shared.microphoneActive {
                 session.personal.draftChain.emitted(nextContextHash: LabUpperBound.hash(leftContext + sentence))
             }
@@ -700,7 +705,11 @@ extension ConverterServer {
                 reference: reference
             )
             guard session.lastHandledKeyEventID == inputID, await WindowContextService.shared.isCurrent(session, generation: referenceGeneration) else { return .init(snapshot: .empty) }
-            let text = suggestion.map { PersonalLearner.shared.normalizedGeneratedText($0.text, scene: session.personal.scene, route: .idle) }
+            let singleLine = session.personal.scene.map { $0.shape == .line || $0.aiDirected } ?? false
+            let text = suggestion.map {
+                AssistanceVerbs.inlineContinuation(PersonalLearner.shared.normalizedGeneratedText($0.text, scene: session.personal.scene, route: .idle),
+                                                   left: leftContext, singleLine: singleLine)
+            }
             return try kanaKanjiConverter.withSession(session.conversionSessionID) {
                 var response = makeResponse(for: session, inputState: session.inputState)
                 if session.manager.isEmpty, !PersonalSensing.shared.microphoneActive, let text {
@@ -724,6 +733,18 @@ extension ConverterServer {
             return try kanaKanjiConverter.withSession(session.conversionSessionID) {
                 var response = makeResponse(for: session, inputState: session.inputState)
                 if session.manager.isEmpty, let text {
+                    response.snapshot.nextTextCompletion = text
+                }
+                return response
+            }
+        case .nextPrompt(let observation, let round):
+            let result = await self.emptyFieldSuggestion(session: session, observation: observation, round: round)
+            return try kanaKanjiConverter.withSession(session.conversionSessionID) {
+                var response = makeResponse(for: session, inputState: session.inputState)
+                response.nextPromptPending = result.pending
+                response.emptyFieldLineRect = result.anchor
+                if session.manager.isEmpty, let text = result.text {
+                    response.windowReferenceUsed = result.fromScreen
                     response.snapshot.nextTextCompletion = text
                 }
                 return response
