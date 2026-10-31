@@ -10,7 +10,8 @@ final class InitializationClient: NSObject, IMKTextInput {
     var usesMarkedReplacementRanges = false, ignoresMarkedReplacementRanges = false
     var reportsEmptyMarkedRangeAtCursor = false
     var supportsDocumentAccess = false, ignoresCallbackMutations = false
-    var selectionOverride: NSRange?
+    var selectionOverride: NSRange?, markedOverride: NSRange?
+    var markedReplacementRanges: [NSRange] = [], markedStrings: [String] = []
     var documentView: NSTextView?
     var onQuery: (() -> Void)?
     private func query() {
@@ -32,6 +33,8 @@ final class InitializationClient: NSObject, IMKTextInput {
     func setMarkedText(_ string: Any!, selectionRange: NSRange, replacementRange: NSRange) {
         if self.inIMKCallback { self.callbackMutations += 1 }
         if self.inIMKCallback && self.ignoresCallbackMutations { return }
+        self.markedReplacementRanges.append(replacementRange)
+        self.markedStrings.append(string as? String ?? (string as? NSAttributedString)?.string ?? "")
         if let documentView {
             documentView.setMarkedText(string as Any, selectedRange: selectionRange, replacementRange: replacementRange)
             self.markedCalls += 1
@@ -45,7 +48,7 @@ final class InitializationClient: NSObject, IMKTextInput {
         self.markedCalls += 1
     }
     func selectedRange() -> NSRange { self.query(); return self.documentView?.selectedRange() ?? self.selectionOverride ?? .init(location: self.inserted.utf16.count + self.marked.utf16.count, length: 0) }
-    func markedRange() -> NSRange { self.query(); return self.documentView?.markedRange() ?? (self.marked.isEmpty ? .init(location: self.reportsEmptyMarkedRangeAtCursor ? self.inserted.utf16.count : NSNotFound, length: 0) : .init(location: self.inserted.utf16.count, length: self.marked.utf16.count)) }
+    func markedRange() -> NSRange { self.query(); return self.documentView?.markedRange() ?? self.markedOverride ?? (self.marked.isEmpty ? .init(location: self.reportsEmptyMarkedRangeAtCursor ? self.inserted.utf16.count : NSNotFound, length: 0) : .init(location: self.inserted.utf16.count, length: self.marked.utf16.count)) }
     func attributedSubstring(from range: NSRange) -> NSAttributedString! { self.query(); return .init(string: "") }
     func length() -> Int { self.query(); return (self.documentView?.string ?? (self.inserted + self.marked)).utf16.count }
     func characterIndex(for point: NSPoint, tracking mappingMode: IMKLocationToOffsetMappingMode, inMarkedRange: UnsafeMutablePointer<ObjCBool>!) -> Int { self.query(); return 0 }
@@ -174,7 +177,34 @@ private enum ExceptionChainSpy { static var calls = 0 }
     selectedController.setClientMarkedText("って", selectionRange: NSRange(location: 2, length: 0), replacementRange: implicit, client: selectedClient)
     selectedController.insertClientText("って", replacementRange: implicit, client: selectedClient)
     check(selectedDocument.string == "前って後", "An intentional selection must still be replaced when typing")
-    return cases + 2
+    // Electron clients can report an unknown selection as a 32-bit NSNotFound, or a stale one. Without an
+    // application-owned marked range, starting a composition must leave the replacement range implicit.
+    let unknown = NSRange(location: Int(Int32.max), length: 0)
+    for (selection, marked) in [(unknown, unknown), (NSRange(location: 57, length: 0), unknown), (unknown, NSRange(location: 0, length: 3))] {
+        let chromiumClient = InitializationClient()
+        chromiumClient.selectionOverride = selection; chromiumClient.markedOverride = marked
+        ShizukuInputController.initializationTestClient = chromiumClient
+        let chromiumController = ShizukuInputController(server: nil, delegate: nil, client: chromiumClient)!
+        chromiumController.setClientMarkedText("k", selectionRange: NSRange(location: 1, length: 0), replacementRange: implicit, client: chromiumClient)
+        chromiumController.setClientMarkedText("か", selectionRange: NSRange(location: 1, length: 0), replacementRange: implicit, client: chromiumClient)
+        check(chromiumClient.markedReplacementRanges.count == 2 && chromiumClient.markedReplacementRanges.allSatisfy { $0.location == NSNotFound },
+              "An unknown or unowned selection must not become an explicit composition start")
+    }
+    // Chromium applies only the difference between compositions. An insertion before an unchanged tail
+    // ("t" -> "っt") must reach the client as a tail replacement followed by an append.
+    let tailClient = InitializationClient()
+    ShizukuInputController.initializationTestClient = tailClient
+    let tailController = ShizukuInputController(server: nil, delegate: nil, client: tailClient)!
+    for text in ["t", "っt", "って"] {
+        tailController.setClientMarkedText(NSAttributedString(string: text, attributes: [.underlineStyle: NSUnderlineStyle.single.rawValue]),
+                                           selectionRange: NSRange(location: text.utf16.count, length: 0), replacementRange: implicit, client: tailClient)
+    }
+    check(tailClient.markedStrings == ["t", "っ", "っt", "って"], "An insertion before the composition tail must be split into end-only updates")
+    check(tailClient.markedReplacementRanges.allSatisfy { $0.location == NSNotFound }, "Split composition updates must keep the replacement implicit")
+    tailController.insertClientText("って", replacementRange: implicit, client: tailClient)
+    tailController.setClientMarkedText("t", selectionRange: NSRange(location: 1, length: 0), replacementRange: implicit, client: tailClient)
+    check(tailClient.markedStrings.last == "t" && tailClient.markedStrings.count == 5, "A new composition must not be compared with committed text")
+    return cases + 7
 }
 
 #if !CLIENT_LIFETIME_TEST && !MENU_VALIDATION_ONLY

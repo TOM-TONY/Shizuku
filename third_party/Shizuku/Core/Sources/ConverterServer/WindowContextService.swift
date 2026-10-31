@@ -40,7 +40,12 @@ final class WindowContextService {
     private var activeSession: ConverterSession?
     private var permissions = (ax: false, screen: false)
     private var permissionProbe: (id: UUID, task: Task<(ax: Bool, screen: Bool), Never>)?
+    /// 許可の定期確認は 5 秒ごと（毎回 tccd への問い合わせになるため）
+    private var lastPermissionCheck = Date.distantPast
     private var message = "オフ"
+    /// 最後にキーを処理した時刻。打鍵中は画面を読まない（入力先のアプリ、とくに Electron 製のアプリの描画を重くしないため）
+    private var lastKey = Date.distantPast
+    static let typingQuietSeconds: TimeInterval = 1.5
 
     static func excluded(_ app: String) -> Bool {
         PersonalPrivacy.defaultExcludedApps.contains(app)
@@ -79,6 +84,7 @@ final class WindowContextService {
             let token = distributed.addObserver(forName: .init(name), object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.locked = value; self?.bind(nil, session: nil)
+                    if value { NextPromptService.shared.reset() }
                 }
             }
             observers.append((distributed, token))
@@ -89,6 +95,7 @@ final class WindowContextService {
         timer?.invalidate(); timer = nil
         for (center, token) in observers { center.removeObserver(token) }; observers = []
         removeAXObserver(); pid = nil; lease.bind(nil); activeSession = nil
+        NextPromptService.shared.reset()
     }
     private func removeAXObserver() {
         if let axObserver { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .commonModes) }
@@ -143,6 +150,8 @@ final class WindowContextService {
             session.manager.windowReference = reference
         }
     }
+    /// キーを処理したときに呼ぶ。手を止めるまで、次の読み取りを始めない
+    func noteKey() { lastKey = Date() }
     func release(_ session: ConverterSession) { if activeSession === session { bind(nil, session: nil) } }
     func receipt(for session: ConverterSession) -> WindowContextReceipt? {
         guard let binding = session.windowBinding, let reference = session.windowReference,
@@ -234,13 +243,18 @@ final class WindowContextService {
 
     private func tick() {
         guard Config.WindowContextEnabled().value else { configure(); return }
-        if permissionProbe == nil { Task { await self.refreshPermissions() } }
+        if permissionProbe == nil, Date().timeIntervalSince(lastPermissionCheck) >= 5 {
+            lastPermissionCheck = Date()
+            Task { await self.refreshPermissions() }
+        }
         guard !locked, let binding = lease.binding, let pid,
               environment.front()?.pid == pid, !Self.excluded(binding.app) else {
             if lease.binding != nil { bind(nil, session: nil) }; return
         }
         guard permissions.ax else { message = "アクセシビリティの許可が必要です"; return }
         if let latest = lease.latest, !latest.isFresh(now: Date().timeIntervalSince1970) { invalidate() }
+        // 打鍵中・入力中の文字があるときは読まない（参考資料は 30 秒まで前の読み取りを使う）
+        guard Date().timeIntervalSince(lastKey) >= Self.typingQuietSeconds, activeSession?.manager.isEmpty ?? true else { return }
         guard working == nil, Date().timeIntervalSince(lastAttempt) >= 2,
               Date().timeIntervalSince(pendingSince) >= 0.5 else { return }
         lastAttempt = Date()
@@ -280,7 +294,7 @@ final class WindowContextService {
         if terminal {
             WindowContextReader.queue.async {
                 let reference = WindowReference(identity: result.identity, capturedAt: Date().timeIntervalSince1970,
-                                                blocks: result.blocks + extra, editing: result.editing, fieldBefore: result.fieldBefore)
+                                                blocks: result.blocks + extra, editing: result.editing, fieldBefore: result.fieldBefore, fieldEmpty: result.fieldEmpty)
                 Task { @MainActor in
                     await self.publish(reference, pid: pid, ticket: ticket, generation: generation, binding: binding, complete: true)
                 }
@@ -292,7 +306,7 @@ final class WindowContextService {
             // A slow OCR path must not withhold successfully acquired AX text.
             WindowContextReader.queue.async {
                 let reference = WindowReference(identity: result.identity, capturedAt: Date().timeIntervalSince1970, blocks: result.blocks,
-                                                editing: result.editing, fieldBefore: result.fieldBefore)
+                                                editing: result.editing, fieldBefore: result.fieldBefore, fieldEmpty: result.fieldEmpty)
                 Task { @MainActor in
                     await self.publish(reference, pid: pid, ticket: ticket, generation: generation, binding: binding, complete: false)
                 }
@@ -311,7 +325,7 @@ final class WindowContextService {
                 WindowContextReader.queue.async {
                     guard !work.cancelled else { return }
                     let reference = WindowReference(identity: result.identity, capturedAt: Date().timeIntervalSince1970, blocks: blocks,
-                                                    editing: result.editing, fieldBefore: result.fieldBefore)
+                                                    editing: result.editing, fieldBefore: result.fieldBefore, fieldEmpty: result.fieldEmpty)
                     Task { @MainActor in
                         await self.publish(reference, pid: pid, ticket: ticket, generation: generation, binding: binding, complete: true)
                     }
@@ -327,7 +341,9 @@ final class WindowContextService {
         guard working == ticket, lease.generation == generation, lease.binding == binding,
               Config.WindowContextEnabled().value, permissions.ax, !locked, environment.front()?.pid == pid else { return }
         if complete { working = nil; captureWork = nil }
-        _ = lease.install(reference, generation: generation, now: Date().timeIntervalSince1970)
+        if lease.install(reference, generation: generation, now: Date().timeIntervalSince1970) {
+            NextPromptService.shared.observe(reference, binding: binding, session: activeSession)
+        }
         message = reference.blocks.isEmpty ? "参照できる文章がありません" : "表示中の文章を参照しています"
     }
 }

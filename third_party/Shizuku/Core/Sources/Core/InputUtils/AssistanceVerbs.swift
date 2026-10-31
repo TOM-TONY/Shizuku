@@ -3,11 +3,20 @@ import CryptoKit
 
 /// IMKに依存しない、採用・退け・戻すの条件。本文は欄の間のメモリにだけ置く。
 public enum AssistanceVerbs {
+    /// 最初の 1 文。先頭の改行・空白は次の文と一緒にする（Tab で改行だけが入り、本文が入らないように見えるため）
     public static func firstSentence(_ text: String) -> String {
-        guard let end = text.firstIndex(where: { "。！？!?\n".contains($0) }) else { return text }
+        let start = text.firstIndex(where: { !$0.isWhitespace }) ?? text.endIndex
+        guard let end = text[start...].firstIndex(where: { "。！？!?\n".contains($0) }) else { return text }
         var next = text.index(after: end)
         while next < text.endIndex, "」』）)]】〉》".contains(text[next]) { next = text.index(after: next) }
         return String(text[..<next])
+    }
+    /// 続きの先頭の改行を除く。チャットの 1 行の欄・AI への入力・改行のない短い下書きでは、新しい段落を始めず同じ行に続ける
+    /// （1 行の欄では改行が見えず、Tab で何も入らないように見える）。それ以外の文書では段落の区切りを残す
+    public static func inlineContinuation(_ text: String, left: String, singleLine: Bool) -> String {
+        guard text.first?.isNewline == true else { return text }
+        guard singleLine || (!left.contains(where: \.isNewline) && left.count < 200) else { return text }
+        return String(text.drop { $0.isWhitespace })
     }
     public static func chunk(_ text: String, all: Bool) -> (text: String, remaining: String) {
         let chosen = all ? text : firstSentence(text)

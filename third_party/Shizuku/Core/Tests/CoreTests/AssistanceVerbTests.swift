@@ -73,3 +73,13 @@ import Testing
     #expect(!learner.tabOwnedByApplication(scene: scene))
     try await Task.sleep(for: .milliseconds(30)); learner.flush()
 }
+
+@Test func tabTakesALeadingNewlineTogetherWithTheNextSentence() {
+    // 先頭が改行の続きで、Tab で改行だけが入って本文が入らないように見えないこと
+    #expect(AssistanceVerbs.chunk("\nどうゆう感じにすればいいのかわからない", all: false).text == "\nどうゆう感じにすればいいのかわからない")
+    #expect(AssistanceVerbs.chunk("\n\n次の段落です。その次。", all: false) == ("\n\n次の段落です。", "その次。"))
+    #expect(AssistanceVerbs.inlineContinuation("\nどうすればいいかわからない", left: "こういうことやりたいけど", singleLine: false) == "どうすればいいかわからない")
+    #expect(AssistanceVerbs.inlineContinuation("\n次の段落です。", left: "一行目\n二行目。", singleLine: false) == "\n次の段落です。")
+    #expect(AssistanceVerbs.inlineContinuation("\n次です。", left: "一行目\n二行目。", singleLine: true) == "次です。")
+    #expect(AssistanceVerbs.inlineContinuation("続きです。", left: "前", singleLine: true) == "続きです。")
+}

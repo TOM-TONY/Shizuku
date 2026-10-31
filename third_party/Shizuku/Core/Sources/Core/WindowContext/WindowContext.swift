@@ -69,20 +69,27 @@ public struct WindowReference: Sendable, Equatable, CustomStringConvertible, Cus
     public let editing: CGRect
     /// 編集中の欄のカーソルより前（最大 4000 字）。本人の下書きなので参考資料のブロックには入れない
     public let fieldBefore: String?
+    /// 編集中の欄が空か（読めなければ nil）
+    public let fieldEmpty: Bool?
     private let surfaceGrams: Set<String>
-    public init(identity: String, capturedAt: Double, blocks: [WindowReferenceBlock], editing: CGRect = .zero, fieldBefore: String? = nil) {
+    public init(identity: String, capturedAt: Double, blocks: [WindowReferenceBlock], editing: CGRect = .zero, fieldBefore: String? = nil,
+                fieldEmpty: Bool? = nil) {
         self.identity = identity; self.capturedAt = capturedAt; self.blocks = Self.clean(blocks)
         self.editing = editing
+        self.fieldEmpty = fieldEmpty
         self.fieldBefore = fieldBefore.flatMap { $0.isEmpty ? nil : String($0.suffix(Self.fieldLimit)) }
         surfaceGrams = self.blocks.reduce(into: Set<String>()) { $0.formUnion(Self.grams($1.text)) }
     }
     public static let fieldLimit = 4000
 
     /// 返信先: 編集中の欄より上で、最も近い本文のブロック（4 字以上）。欄の位置が分からなければ nil
-    public var replyTarget: WindowReferenceBlock? {
+    public var replyTarget: WindowReferenceBlock? { replyTarget { _ in true } }
+
+    /// 返信先を、include を満たすブロックの中から選ぶ
+    public func replyTarget(where include: (WindowReferenceBlock) -> Bool) -> WindowReferenceBlock? {
         guard editing.height > 0 else { return nil }
         return blocks.filter { block in
-            block.rect.height > 0 && block.rect.maxY <= editing.minY + 4 && block.text.count >= 4 && block.role != "AXLink"
+            include(block) && block.rect.height > 0 && block.rect.maxY <= editing.minY + 4 && block.text.count >= 4 && block.role != "AXLink"
                 && block.rect.maxX > editing.minX - 40 && block.rect.minX < editing.maxX + 40
         }.max { $0.rect.maxY == $1.rect.maxY ? $0.rect.minX > $1.rect.minX : $0.rect.maxY < $1.rect.maxY }
     }
@@ -255,7 +262,7 @@ public enum WindowReferenceGeneration {
         return true
     }
 
-    private static func numbers(in text: String) -> Set<String> {
+    static func numbers(in text: String) -> Set<String> {
         let normalized = text.precomposedStringWithCompatibilityMapping
         guard let regex = try? NSRegularExpression(pattern: "[0-9]+(?:[.,][0-9]+)*") else { return [] }
         let string = normalized as NSString

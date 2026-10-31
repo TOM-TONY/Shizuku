@@ -8,6 +8,7 @@ struct ConfigWindow: View {
     @ConfigState private var nextTextCompletion = Config.NextTextCompletion()
     @ConfigState private var nextTextCompletionInlineGhost = Config.NextTextCompletionInlineGhost()
     @ConfigState private var nextTextCompletionIdle = Config.NextTextCompletionIdle()
+    @ConfigState private var nextPromptSuggestion = Config.NextPromptSuggestion()
     @ConfigState private var inputStyle = Config.InputStyle()
     @ConfigState private var zenzaiProfile = Config.ZenzaiProfile()
     @ConfigState private var zenzaiPersonalizationLevel = Config.ZenzaiPersonalizationLevel()
@@ -803,9 +804,17 @@ struct ConfigWindow: View {
                     Group {
                         self.describedToggle(
                             "放置時に本文を生成します",
-                            "何も打たずに 3 秒待つと、次の文を書いて出します。Tab で入れると、さらに続きを書きます。入力メニューからも切り替えられます。",
+                            "何も打たずに 3 秒待つと、次の文を書いて出します。空の欄では、その場面のいつもの書き出しを出します。Tab で入れると、さらに続きを書きます。入力メニューからも切り替えられます。",
                             isOn: $nextTextCompletionIdle
                         )
+                        if $nextTextCompletionIdle.wrappedValue {
+                            self.describedToggle(
+                                "AI との会話では、次に送りそうな依頼を出す",
+                                "AI の返答が出そろうと、ローカル LLM（いい感じ変換のモデル）で次の依頼を 1 文先に作り、空の欄で手を止めたら書き出しの代わりに出します。「ウィンドウの参照」がオンのときだけ働きます。",
+                                isOn: $nextPromptSuggestion
+                            )
+                            .padding(.leading, 20)
+                        }
                         self.modelPicker(
                             key: Config.NextTextCompletionModel.key,
                             detail: "Neural Engine で動かすモデルです。Gemma 4 E4B が標準で、E2B は計算量が約半分（省電力）で精度は少し下がります。gemma4/convert_gemma4.py で変換したものをモデルのフォルダに置くと選べます。"

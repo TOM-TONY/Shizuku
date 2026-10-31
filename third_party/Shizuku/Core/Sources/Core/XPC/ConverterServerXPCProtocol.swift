@@ -126,6 +126,10 @@ public enum ConverterCompletionCommand: Codable, Sendable {
     case idleAccepted(text: String)
     /// llm-ime: 場面学習。空の入力欄で、その場面のいつもの書き出し（骨組み）を尋ねる。結果は snapshot.nextTextCompletion（なければ nil）
     case skeleton(scene: ConverterSceneObservation)
+    /// llm-ime: 空の欄で手を止めたときの提案を尋ねる。AI との会話では画面の最後の返答から先に作っておいた次の依頼、
+    /// それ以外ではその場面のいつもの書き出し。結果は snapshot.nextTextCompletion。次の依頼をまだ作っていれば
+    /// nextPromptPending が true（Client は間を置いて尋ね直す）。round は同じ欄で尋ねた回数（0 が最初）
+    case nextPrompt(scene: ConverterSceneObservation, round: Int)
     /// llm-ime: AI への指示の場面の短い確定 text が指す、画面の選択肢の行を尋ねる。結果は windowHint
     case windowHint(text: String)
     /// 動詞の記録。本文を受け取らず、場面・件数・退けた内容のハッシュだけ。
@@ -508,6 +512,10 @@ public struct ConverterServerResponse: Codable, Sendable {
     public var windowReferenceUsed: Bool?
     /// llm-ime: 短い確定が指す画面の選択肢の行（なければ nil）
     public var windowHint: String?
+    /// llm-ime: `.nextPrompt` で、次の依頼をまだ作っている（Client は間を置いて尋ね直す）
+    public var nextPromptPending: Bool?
+    /// llm-ime: 空の欄の先頭の行の位置（画面の読み取りから。画面座標・左下原点）。アプリが欄の位置を返さないときに使う
+    public var emptyFieldLineRect: CGRect?
 
     public init(
         handled: Bool = true,

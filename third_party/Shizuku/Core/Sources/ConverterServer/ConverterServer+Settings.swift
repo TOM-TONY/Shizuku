@@ -308,6 +308,10 @@ extension ConverterServer {
             Config.WindowContextEnabled().value = try boolSettingValue(value, key: key)
             WindowContextService.shared.configure(); return
         }
+        if key == Config.NextPromptSuggestion.key {
+            Config.NextPromptSuggestion().value = try boolSettingValue(value, key: key)
+            NextPromptService.shared.reset(); return
+        }
         if key == Config.WindowContextExcludedApps.key {
             guard case .string(let apps) = value else { throw ConverterServerError.invalidSettingValue(key) }
             Config.WindowContextExcludedApps().value = apps
@@ -454,6 +458,7 @@ extension ConverterServer {
         let updated = status.updatedAt.map { Date(timeIntervalSince1970: $0).formatted(date: .omitted, time: .standard) } ?? "未取得"
         return [
             .init(key: Config.WindowContextEnabled.key, title: "入力先ウィンドウの会話・資料を参考にする", section: "ウィンドウの参照", kind: .toggle, value: .bool(Config.WindowContextEnabled().value)),
+            .init(key: Config.NextPromptSuggestion.key, title: "AIとの会話では、次に送りそうな依頼を出す（放置時に本文を生成の中）", section: "ウィンドウの参照", kind: .toggle, value: .bool(Config.NextPromptSuggestion().value), isEnabled: Config.WindowContextEnabled().value),
             .init(key: Config.WindowContextExcludedApps.key, title: "読み取らないアプリのbundle ID（改行・カンマ区切り）", section: "ウィンドウの参照", kind: .textField(secure: false), value: .string(Config.WindowContextExcludedApps().value)),
             .init(key: Config.windowContextStatusKey, title: "\(status.state)／アクセシビリティ: \(status.accessibility ? "許可済み" : "未許可")／画面収録: \(status.screenRecording ? "許可済み" : "未許可")／\(status.app ?? "参照なし")／最終更新: \(updated)", section: "ウィンドウの参照", kind: .textField(secure: false), isEnabled: false)
         ]
