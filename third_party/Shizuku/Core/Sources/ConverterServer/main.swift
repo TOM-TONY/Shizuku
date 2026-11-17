@@ -33,11 +33,15 @@ final class ConverterServer: NSObject, ConverterServerXPCProtocol, @unchecked Se
             _ = try handle(.synchronizeUserDictionary(forceExport: false))
             dictionaryPrepared = true
         } catch { }
-        inputPrepared = dictionaryPrepared && kanaKanjiConverter.prepareZenzaiModel(at:
+        // Load the model even when the dictionary export failed. Skipping it here would move
+        // the tens-of-seconds load onto the first key, after the listener is already open.
+        let modelPrepared = kanaKanjiConverter.prepareZenzaiModel(at:
             SegmentsManager.conversionModelURL(resourcesDirectoryURL: Self.appResourcesDirectoryURL()))
+        inputPrepared = dictionaryPrepared && modelPrepared
         let milliseconds = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+        // Startup durations are rare and needed days later, so keep them at a persisted level.
         Logger(subsystem: "dev.tomonari.inputmethod.Shizuku", category: "startup")
-            .notice("phase=input_resources ready=\(self.inputPrepared) dictionary=\(dictionaryPrepared) milliseconds=\(milliseconds)")
+            .error("phase=input_resources ready=\(self.inputPrepared) dictionary=\(dictionaryPrepared) model=\(modelPrepared) milliseconds=\(milliseconds)")
     }
 
     func openSession(with reply: @escaping @Sendable (String) -> Void) {
@@ -133,6 +137,12 @@ final class ConverterServer: NSObject, ConverterServerXPCProtocol, @unchecked Se
     private func handle(_ command: ConverterMaintenanceCommand) throws -> ConverterServerResponse {
         switch command {
         case .synchronizeUserDictionary(let forceExport):
+            // The IME sends this on every launch, on the same executor as key handling.
+            let started = ProcessInfo.processInfo.systemUptime
+            defer {
+                Logger(subsystem: "dev.tomonari.inputmethod.Shizuku", category: "startup")
+                    .error("phase=user_dictionary_sync forced=\(forceExport) milliseconds=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))")
+            }
             let memoryDirectoryURL = AppGroup.memoryDirectoryURL()
             if forceExport || !CompiledUserDictionaryStore.hasExportedDictionary(memoryDirectoryURL: memoryDirectoryURL) {
                 try CompiledUserDictionaryStore.exportCurrentDictionaries(memoryDirectoryURL: memoryDirectoryURL)
@@ -491,9 +501,12 @@ if CommandLine.arguments.contains("--wait-ready") {
     exit(ConverterServerReadiness.wait() ? EXIT_SUCCESS : EXIT_FAILURE)
 }
 
+private let startupBegan = ProcessInfo.processInfo.systemUptime
 // azooKey の名前だった頃の設定とデータを、使い始める前に引き継ぐ
 AppGroup.migratePreferencesFromAzooKeyIfNeeded()
 AppGroup.migrateDataFromAzooKeyIfNeeded()
+// 新しく入れた Mac では、メモリと入っているモデルに合わせた設定で始める（本人の設定があれば変えない）
+let recommendedSetupOutcome = RecommendedSetup.applyOnFirstRunIfNeeded()
 AssistanceSettings.migrateIfNeeded()
 // llm-ime: 場面学習の記録を裏で開き、覚えた語を読み込んでおく。自己調整を 10 分ごとに見る
 // llm-ime: 確かめ用の記録の場所（通しの確かめのときだけ）の準備・後片付け
@@ -507,13 +520,20 @@ MainActor.assumeIsolated {
     PersonalSensing.shared.configure(scene: nil)
     PersonalEmbeddingService.shared.start()
     PersonalTuningScheduler.shared.start()
+    if recommendedSetupOutcome == .applied, Config.NextTextCompletion().value {
+        NextTextCompletionEngine.shared.preload()
+    }
 }
 
 let listener = NSXPCListener(machServiceName: ConverterServerXPC.machServiceName)
+private let servicesStarted = ProcessInfo.processInfo.systemUptime
 private let delegate = ServiceDelegate()
 // Core ML can compile a newly installed ANE model for tens of seconds. Finish that
 // work before advertising readiness, so the first key does not hit the 1s client timeout.
 MainActor.assumeIsolated { delegate.prepareInputResources() }
 listener.delegate = delegate
 listener.resume()
+// Until this point no key can be answered. Record how long each start kept input waiting.
+Logger(subsystem: "dev.tomonari.inputmethod.Shizuku", category: "startup")
+    .error("phase=listening services_milliseconds=\(Int((servicesStarted - startupBegan) * 1000)) total_milliseconds=\(Int((ProcessInfo.processInfo.systemUptime - startupBegan) * 1000))")
 RunLoop.current.run()

@@ -98,6 +98,13 @@ extension ConverterServer {
                 capabilities: capabilities
             ),
             descriptor(
+                key: Config.recommendedSetupSummaryKey,
+                title: RecommendedSetup.currentPlan().summary,
+                section: "おすすめの設定",
+                kind: .textField(secure: false),
+                isEnabled: false
+            ),
+            descriptor(
                 key: Config.TypeBackSlash.key,
                 title: "円記号の代わりにバックスラッシュを入力",
                 section: "入力オプション",
@@ -349,6 +356,13 @@ extension ConverterServer {
             }
             Config.LocalLLMModel().value = name
             LabController.shared.modelChanged()
+        case Config.applyRecommendedSetupSettingKey:
+            guard try boolSettingValue(value, key: key) else { return }
+            _ = RecommendedSetup.applyCurrent()
+            LabController.shared.modelChanged()
+            if Config.NextTextCompletion().value {
+                NextTextCompletionEngine.shared.preload()
+            }
         case Config.openModelFolderSettingKey:
             // サンドボックスの IME 本体からは開けないので、こちらで Finder に出す
             try? FileManager.default.createDirectory(at: ModelCatalog.directory, withIntermediateDirectories: true)

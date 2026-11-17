@@ -207,6 +207,104 @@ private enum ExceptionChainSpy { static var calls = 0 }
     return cases + 7
 }
 
+/// A Server that stops answering must not hold typed keys forever: after the limit the
+/// controller drops them, commits the visible composition, and lets keys reach the application.
+@MainActor private func testStalledKeysAreReleased() -> Int {
+    let previousClient = ShizukuInputController.initializationTestClient
+    let previousTransport = ConverterServerClient.initializationTestTransport
+    defer {
+        ShizukuInputController.initializationTestClient = previousClient
+        ConverterServerClient.initializationTestTransport = previousTransport
+        ConverterServerClient.initializationTestProbeAlive = false
+    }
+    func drain(_ seconds: Double = 0.08) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline { _ = RunLoop.current.run(mode: .default, before: deadline) }
+    }
+    let client = InitializationClient()
+    ShizukuInputController.initializationTestClient = client
+    ConverterServerClient.initializationTestProbeAlive = false
+    var requests: [ConverterKeyEventRequest] = []
+    var answering = true
+    ConverterServerClient.initializationTestTransport = { command, reply in
+        let session: ConverterSessionCommand
+        switch command {
+        case .openSession(_, let value), .session(_, let value): session = value
+        default: reply(nil); return
+        }
+        // Only key events are answered; follow-up queries get no response, as from a busy Server.
+        guard case .handleKeyEvent(let request) = session else { reply(nil); return }
+        requests.append(request)
+        guard answering else { return }
+        var snapshot = ConverterSessionSnapshot.empty
+        snapshot.markedText = .init(elements: [.init(content: "あ", focus: .unfocused)], selectionRange: .init(location: 1, length: 0))
+        snapshot.isEmpty = false
+        reply(.init(effects: [], inputState: .composing, snapshot: snapshot))
+    }
+    let controller = ShizukuInputController(server: nil, delegate: nil, client: client)!
+    controller.activateServer(client); drain()
+    func key(_ code: UInt16, _ characters: String) -> Bool {
+        controller.handle(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: characters, charactersIgnoringModifiers: characters,
+            isARepeat: false, keyCode: code)!, client: client)
+    }
+    check(key(0, "a")); drain()
+    check(client.marked == "あ" && client.inserted.isEmpty, "A healthy Server must compose as before")
+    check(!ConverterServerAvailability.shared.isUnavailable)
+
+    // The Server stops answering. Keys are still owned by the IME while it waits.
+    answering = false
+    check(key(0, "a")); check(key(0, "a")); drain()
+    let stalledID = requests.last!.eventID
+    drain(2.2)
+    check(!ConverterServerAvailability.shared.isUnavailable, "A wait shorter than the limit must keep the keys queued")
+    check(client.marked == "あ" && client.inserted.isEmpty)
+    drain(1.4)
+    check(ConverterServerAvailability.shared.isUnavailable, "Keys with no answer past the limit must be released")
+    check(client.inserted == "あ" && client.marked.isEmpty, "The visible composition must be committed as shown")
+    // The Server may still hold that composition. A commit request must not insert it again.
+    controller.commitComposition(client); drain()
+    check(client.inserted == "あ", "A commit after the release must not insert the composition twice")
+    check(controller.converterServerClient.pendingCommandCount == 0, "Released keys must leave the queue")
+    check(requests.allSatisfy { $0.eventID <= stalledID }, "Only the head key may have been sent while stalled")
+
+    // An Enter pressed while nothing responded must not submit the text that was just committed.
+    let sentWhileStalled = requests.count
+    check(key(36, "\r"), "Enter right after the release must be absorbed")
+    drain(1.1)
+    // After that, keys reach the application instead of vanishing.
+    check(!key(0, "a")); check(!key(36, "\r")); check(!key(51, "\u{8}")); drain()
+    check(requests.count == sentWhileStalled, "No key may be sent to an unavailable Server")
+
+    // The Server returns. The first key tells it to drop whatever the released keys left behind.
+    answering = true
+    ConverterServerClient.initializationTestProbeAlive = true
+    drain(1.4)
+    check(!ConverterServerAvailability.shared.isUnavailable, "A probe answer must restore normal routing")
+    check(key(0, "a")); drain()
+    check(requests.count == sentWhileStalled + 1)
+    check(requests.last!.eventID > stalledID + 1, "Released keys must not be replayed")
+    check(requests.last!.activation?.resetComposition == true, "The first key after a release must reset the Server composition")
+    check(client.marked == "あ" && client.inserted == "あ")
+    check(key(0, "a")); drain()
+    check(requests.last!.activation == nil, "The reset is sent once")
+
+    // Leaving the field with unanswered keys drops them; the next field starts clean.
+    answering = false
+    check(key(0, "a")); check(key(0, "a")); drain()
+    controller.deactivateServer(client); drain()
+    check(controller.converterServerClient.pendingCommandCount == 0, "Keys of the field being left must not stay queued")
+    answering = true
+    let sentBeforeReturn = requests.count
+    controller.activateServer(client); drain()
+    check(key(0, "a")); drain()
+    check(requests.count == sentBeforeReturn + 1, "Keys typed in the previous field must not be replayed")
+    check(requests.last!.activation?.resetComposition == true)
+    check(!ConverterServerAvailability.shared.isUnavailable, "Leaving a field is not a Server outage")
+    controller.deactivateServer(client); drain()
+    return 3
+}
+
 #if !CLIENT_LIFETIME_TEST && !MENU_VALIDATION_ONLY
 @main struct ClientInitializationTests {
     @MainActor static func main() throws {
@@ -564,6 +662,7 @@ private enum ExceptionChainSpy { static var calls = 0 }
         #endif
         #if !INITIALIZATION_MEASURE_ONLY
         let pastedTextCases = testPastedTextPreservation()
+        let stalledKeyCases = testStalledKeysAreReleased()
         let previousExceptionHandler = NSGetUncaughtExceptionHandler()
         NSSetUncaughtExceptionHandler { _ in ExceptionChainSpy.calls += 1 }
         InputTrace.installExceptionHandler()
@@ -659,6 +758,7 @@ private enum ExceptionChainSpy { static var calls = 0 }
         output["menuReentrantDeactivations"] = reentrantDeactivations
         output["assistanceWindowsBecameKey"] = becameKey
         output["pastedTextCases"] = pastedTextCases
+        output["stalledKeyCases"] = stalledKeyCases
         output["committedUndoCases"] = 4
         output["deferredAssistanceCases"] = 18
         #endif

@@ -67,8 +67,11 @@ build_update_key_tool() {  # $1: 出力先ディレクトリ
 # IME 本体を archive・書き出し・署名・公証する → $OUT/ime/Shizuku.app
 build_ime() {  # $1: OUT, $2: VERSION, $3: BUILD
     local out="$1" version="$2" build="$3"
+    # GitHub Actions では Apple ID の代わりに API キーでプロファイルを取る（ci_prepare.sh が設定する。空白を含まない）
+    local auth_args=(${XCODE_AUTH_ARGS:-})
     echo "== IME 本体をビルド（$version / ${build}）"
     xcodebuild -project "$IME/Shizuku.xcodeproj" -scheme Shizuku -configuration Release \
+        ${auth_args[@]+"${auth_args[@]}"} \
         archive -archivePath "$out/Shizuku.xcarchive" \
         -derivedDataPath "$IME/build/dd-dist" -clonedSourcePackagesDirPath "$IME/build/dd-signed/SourcePackages" \
         -destination "generic/platform=macOS" ARCHS=arm64 \
@@ -91,6 +94,7 @@ build_ime() {  # $1: OUT, $2: VERSION, $3: BUILD
 </dict></plist>
 EOF
         xcodebuild -exportArchive -archivePath "$out/Shizuku.xcarchive" -exportPath "$out/export" \
+            ${auth_args[@]+"${auth_args[@]}"} \
             -exportOptionsPlist "$out/exportOptions.plist" -allowProvisioningUpdates > "$out/export.log" 2>&1 \
             || { tail -30 "$out/export.log"; exit 1; }
         mv "$out/export/Shizuku.app" "$app"

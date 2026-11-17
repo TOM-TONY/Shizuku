@@ -39,6 +39,17 @@ extension ConverterServer {
         NextTextCompletionEngine.shared.beginKeyWork()
         defer { NextTextCompletionEngine.shared.endKeyWork() }
         if let activation = request.activation {
+            if activation.resetComposition == true {
+                // Client が応答待ちのキーを破棄した。破棄されたキーの一部は既に処理済みかも
+                // しれないので、その入力中の文字を新しいキーへ持ち越さない。
+                session.beginOfferStop()
+                session.personal.skeletonOffer = nil
+                session.emptyOfferScene = nil
+                self.abandonStall(session: session)
+                session.manager.stopComposition()
+                session.inputState = .none
+                session.clearReplaceSuggestions()
+            }
             session.config = activation.config
             session.inputLanguage = activation.inputLanguage
             if activation.inputLanguage == .english {

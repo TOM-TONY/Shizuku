@@ -38,6 +38,7 @@ struct ConfigWindow: View {
     /// llm-ime: 記録を消すアプリ（確かめるダイアログに出す）
     @State private var personalForgetTarget: ConverterSettingDescriptor?
     @State private var converterSettingsLoading = false
+    @State private var recommendedSetupApplied = false
     @State private var converterSettingsErrorMessage: String?
     @State private var selectedTab: Tab = .basic
     @State private var zenzaiProfileHelpPopover = false
@@ -145,6 +146,14 @@ struct ConfigWindow: View {
             DispatchQueue.main.async {
                 guard success else {
                     self.converterSettingsErrorMessage = "Converter Processに設定を保存できませんでした"
+                    self.reloadConverterSettings()
+                    return
+                }
+                if key == Config.applyRecommendedSetupSettingKey {
+                    // Server が書いた設定を、この画面の表示にも読み直させる（別プロセスの書き込みは通知されない）
+                    Config.userDefaults.synchronize()
+                    NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: Config.userDefaults)
+                    self.recommendedSetupApplied = true
                     self.reloadConverterSettings()
                     return
                 }
@@ -620,6 +629,7 @@ struct ConfigWindow: View {
     @ViewBuilder
     private var basicTabView: some View {
         Form {
+            self.recommendedSetupSection
             self.assistanceAxesSection
             self.windowContextSection
             Section {
@@ -958,6 +968,36 @@ struct ConfigWindow: View {
                 Button("状態を更新") { self.reloadConverterSettings() }
             }
         } header: { Label("ウィンドウの参照", systemImage: "macwindow") }
+    }
+
+    /// llm-ime: メモリと入っているモデルに合わせた設定を、ボタン 1 つで選ぶ
+    private var recommendedSetupSection: some View {
+        Section {
+            if let summary = self.converterSettingDescriptors[Config.recommendedSetupSummaryKey] {
+                Text(summary.title)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("この Mac に最適な設定にする") {
+                    self.recommendedSetupApplied = false
+                    self.updateConverterSetting(key: Config.applyRecommendedSetupSettingKey, value: .bool(true))
+                }
+                .disabled(self.converterSettingDescriptors[Config.recommendedSetupSummaryKey] == nil)
+                if self.recommendedSetupApplied {
+                    Label("設定しました", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            Text("モデルと、続きの予測・いい感じ変換のオン・オフを選び直します。学習やウィンドウの参照の設定は変えません。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } header: {
+            Label("おすすめの設定", systemImage: "wand.and.stars")
+        }
     }
 
     @ViewBuilder private var assistanceAxesSection:

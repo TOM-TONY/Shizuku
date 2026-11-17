@@ -7,7 +7,7 @@ import Security
 // 配信元（GitHub Releases）の update.json を読み、今の通し番号（CFBundleVersion）より新しければ、管理アプリの zip
 // （IME 本体を含む）をダウンロードして入れ替える。入れ替える前に次を確かめる:
 //   1. zip の大きさと SHA-256 が update.json と同じ
-//   2. update.json の署名（Ed25519。秘密鍵は配信する人の Mac のキーチェーンだけにある）が、管理アプリに埋め込んだ公開鍵で正しい
+//   2. update.json の署名（Ed25519。秘密鍵は配信する人のキーチェーンと、配信に使う GitHub の release 環境にだけある）が、管理アプリに埋め込んだ公開鍵で正しい
 //   3. 展開したアプリが、同じチーム（Developer ID）の署名で、改ざんされていない。bundle ID と通し番号が update.json と同じ
 // 通信するのはこの確認とダウンロードだけ（IME 本体は通信しない）。
 

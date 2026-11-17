@@ -50,6 +50,12 @@ def main():
                 begin = text.index(marker) + len(marker)
                 end = text.index('\n    private func ', begin)
                 text = text[:begin] + '\n        completion(InitializationXPCProxy())\n    }\n' + text[end:]
+            marker = '    static func probeServer(timeout: TimeInterval, completion: @escaping @MainActor (Bool) -> Void) {'
+            if marker in text:
+                begin = text.index(marker) + len(marker)
+                end = text.index('\n    private func ', begin)
+                text = text[:begin] + '\n        completion(Self.initializationTestProbeAlive)\n    }\n' + text[end:]
+                text = text.replace('    nonisolated init() {}', '    static var initializationTestProbeAlive = false\n    nonisolated init() {}', 1)
             marker = '    private func ensureConnection() -> NSXPCConnection {'
             text = text.replace(marker, marker + '\n        preconditionFailure("Real XPC is forbidden in this test")', 1)
             text = text.replace('@objc private protocol ConverterServerXPCProtocol', '@objc protocol ConverterServerXPCProtocol', 1)

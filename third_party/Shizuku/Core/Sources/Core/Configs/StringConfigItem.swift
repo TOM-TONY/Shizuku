@@ -46,6 +46,11 @@ extension Config {
     /// llm-ime: 設定画面の「モデルのフォルダを開く」（値は使わない。ConverterServer が Finder で開く）
     public static let openModelFolderSettingKey = "dev.tomonari.inputmethod.Shizuku.action.openModelFolder"
 
+    /// llm-ime: 設定画面の「この Mac に最適な設定にする」（値は使わない。入っているモデルを読める ConverterServer が扱う）
+    public static let applyRecommendedSetupSettingKey = "dev.tomonari.inputmethod.Shizuku.action.applyRecommendedSetup"
+    /// llm-ime: 設定画面に出す、おすすめの内容の説明（ConverterServer が作る）
+    public static let recommendedSetupSummaryKey = "dev.tomonari.inputmethod.Shizuku.recommendedSetup.summary"
+
     /// llm-ime: 場面学習で記録しないアプリ（bundle ID を改行区切り）。パスワード管理などは既定で除外（PersonalPrivacy）。ターミナル類は記録する
     public struct PersonalLearningExcludedApps: StringConfigItem {
         public init() {}

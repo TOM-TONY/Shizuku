@@ -47,6 +47,18 @@ struct Manifest: Decodable {
         Set(models.filter { $0.isRequired || memoryGB >= $0.recommendedMemoryGB }.map(\.name))
     }
 
+    /// メモリに合うモデルのうち、空き容量に収まるもの。収まらなければ大きいものから外す（必須のモデルは外さない）
+    func recommendedModelNames(memoryGB: Int, freeBytes: Int64, reserveBytes: Int64 = 3_000_000_000) -> Set<String> {
+        var names = self.recommendedModelNames(memoryGB: memoryGB)
+        var total = self.selectedModels(names).map(\.bytes).reduce(0, +)
+        let optional = self.models.filter { names.contains($0.name) && !$0.isRequired }.sorted { $0.bytes > $1.bytes }
+        for model in optional where total + reserveBytes >= freeBytes {
+            names.remove(model.name)
+            total -= model.bytes
+        }
+        return names
+    }
+
     func selectedModels(_ names: Set<String>) -> [Model] {
         models.filter { $0.isRequired || names.contains($0.name) }
     }

@@ -41,13 +41,18 @@ final class ManagerModel: ObservableObject {
         } else {
             self.manifest = nil
         }
-        self.selected = self.manifest?.recommendedModelNames(memoryGB: self.system.memoryGB) ?? []
+        self.selectRecommendedModels()
         if self.isInstalledCopy {
             self.autoCheck = Installer.isAutoUpdateCheckEnabled
         }
         if justUpdated {
             self.phase = .updated
         }
+    }
+
+    /// この Mac のメモリと空き容量に合わせて、入れるモデルを選ぶ
+    func selectRecommendedModels() {
+        self.selected = self.manifest?.recommendedModelNames(memoryGB: self.system.memoryGB, freeBytes: self.system.freeBytes) ?? []
     }
 
     var currentVersion: String {
@@ -270,7 +275,11 @@ struct ManagerView: View {
             Text("この Mac では使えません。Apple シリコン（M1 以降）の Mac と macOS 15 以降が必要です。")
                 .foregroundStyle(.red)
         } else if let manifest = self.model.manifest {
-            Text("入れるモデル（この Mac のメモリ: \(system.memoryGB) GB）").font(.headline)
+            HStack {
+                Text("入れるモデル（この Mac のメモリ: \(system.memoryGB) GB）").font(.headline)
+                Spacer()
+                Button("この Mac に最適なものを選ぶ") { self.model.selectRecommendedModels() }
+            }
             ForEach(manifest.models) { item in
                 Toggle(isOn: Binding(
                     get: { item.isRequired || self.model.selected.contains(item.name) },
@@ -313,9 +322,10 @@ struct ManagerView: View {
             2. 左下の「＋」→「日本語」→「Shizuku (日本語)」を選んで「追加」
                （英字入力用に「Shizuku (English)」も追加しておくと便利です）
             3. メニューバーの入力メニューから Shizuku を選ぶ
-            4. 入力メニューの Shizuku →「設定…」で「文章の続きを予測する」をオン、「いい感じ変換」で「ローカル LLM」を選ぶ
             """)
             .fixedSize(horizontal: false, vertical: true)
+            Text("初めて入れたときは、モデルと設定をこの Mac に合わせて自動で選びます。あとから選び直すときは、入力メニューの Shizuku →「設定…」→「この Mac に最適な設定にする」を押してください。")
+                .fixedSize(horizontal: false, vertical: true)
             Text("最初の変換と、最初の続きの予測は、準備に 1〜2 分かかります。この管理アプリは「アプリケーション」フォルダ（ホーム）に入りました。アップデートやアンインストールはそこから開いてください。DMG は取り出してかまいません。")
                 .font(.callout)
                 .foregroundStyle(.secondary)

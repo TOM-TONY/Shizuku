@@ -68,6 +68,23 @@ public final class OrderedAsyncCommandQueue<Value> {
         startNextIfNeeded()
     }
 
+    /// 待っているコマンドをすべて取り消し、投入順に `value` で完了させる。
+    ///
+    /// 実行中の先頭コマンドは、後から届く応答・タイムアウト・再試行を無視する。
+    /// 入力先が変わったときや Server が応答しないときに、古いキーを後から再生しないために使う。
+    @MainActor public func cancelAll(finishingWith value: Value) {
+        guard !entries.isEmpty else {
+            return
+        }
+        let cancelled = entries
+        entries.removeAll()
+        activeOperationID = nil
+        for entry in cancelled {
+            entry.completion(value)
+        }
+        startNextIfNeeded()
+    }
+
     @MainActor private func startNextIfNeeded() {
         guard activeOperationID == nil, let entry = entries.first else {
             return

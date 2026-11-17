@@ -21,6 +21,8 @@ enum InputTrace {
         case noSession = "no_session", reconnectWait = "reconnect_wait", retry, connect, interrupted, invalidated, proxyError = "proxy_error", noProxy = "no_proxy"
         case remoteError = "remote_error", noData = "no_data", encodeError = "encode_error", decodeError = "decode_error", timeout
         case objcUncaught = "objc_uncaught"
+        case cancelled, keyStall = "key_stall", serverUnavailable = "server_unavailable", serverRecovered = "server_recovered"
+        case firstKey = "first_key"
     }
     enum State: String {
         case none, attachDiacritic, composing, previewing, selecting, replaceSuggestion, unicodeInput
@@ -44,6 +46,13 @@ enum InputTrace {
                                    key: Int = -1, modifiers: UInt = 0, state: State = .none,
                                    length: Int = 0, effects: UInt64 = 0, reason: Reason = .none, number: Int = 0) {
         self.logger.notice("stage=\(stage.rawValue, privacy: .public) c=\(controller) r=\(request) key=\(key) modifiers=\(modifiers) state=\(state.rawValue, privacy: .public) length=\(length) effects=\(effects) reason=\(reason.rawValue, privacy: .public) n=\(number)")
+    }
+
+    /// Rare events that must still be readable days later (the per-key trace is rotated within hours).
+    /// Same rule as `event`: fixed codes and numbers only.
+    @inline(never) static func persistent(_ reason: Reason, controller: UInt64, milliseconds: Int, number: Int = 0) {
+        // Same fields as `event`, so one parser reads both. `length` carries the milliseconds.
+        self.logger.error("stage=persistent c=\(controller) r=0 key=-1 modifiers=0 state=none length=\(milliseconds) effects=0 reason=\(reason.rawValue, privacy: .public) n=\(number)")
     }
 
     static func requestID(_ command: ConverterSessionCommand) -> UInt64 {

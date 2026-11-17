@@ -292,3 +292,29 @@ import Testing
     #expect(decoded.inputLanguage == .english)
     #expect(decoded.settings == [setting])
 }
+
+@Test func sessionActivationOmitsCompositionResetUnlessRequested() throws {
+    let config = ConverterSessionConfig(
+        aiBackendPreference: .off,
+        openAIModelName: "model",
+        openAIEndpoint: "https://example.com",
+        openAIAPIKey: .init("dummy"),
+        includeContextInAITransform: false
+    )
+    // An activation without the flag stays byte-compatible with a peer built before the flag
+    // existed: the key is absent when encoding, and a missing key decodes as "no reset".
+    let plain = ConverterSessionActivation(config: config, inputLanguage: .english)
+    let plainData = try JSONEncoder().encode(plain)
+    #expect(!String(decoding: plainData, as: UTF8.self).contains("resetComposition"))
+    let decodedPlain = try JSONDecoder().decode(ConverterSessionActivation.self, from: plainData)
+    #expect(decodedPlain.resetComposition == nil)
+    #expect(decodedPlain == plain)
+
+    let reset = ConverterSessionActivation(config: config, inputLanguage: .japanese, resetComposition: true)
+    let decodedReset = try JSONDecoder().decode(
+        ConverterSessionActivation.self,
+        from: JSONEncoder().encode(reset)
+    )
+    #expect(decodedReset.resetComposition == true)
+    #expect(decodedReset.inputLanguage == .japanese)
+}

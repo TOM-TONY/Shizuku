@@ -23,6 +23,12 @@ final class ConverterServerClient {
     private var longRequestConnection: NSXPCConnection?
     private var sessionID: String?
     private var hasOpenedSession = false
+    /// 開こうとしているセッションの ID。取り消されたキーと次のキーが同じセッションを開くように、開けるまで使い回す
+    private var proposedSessionID: String?
+    /// 開いたセッションへ、まだ現在の設定と入力言語を届けていない（キー以外の命令が開いた場合を含む）
+    private var sessionNeedsActivation = false
+    /// `cancelPendingCommands` のたびに進める。取り消した試行へ遅れて届いた応答を無視するために使う
+    private var cancelGeneration: UInt64 = 0
     private var shouldAttemptReconnect = false
     private var nextReconnectAttemptDate = Date.distantPast
     private let commandQueue = OrderedAsyncCommandQueue<ConverterServerResponse?>()
@@ -131,11 +137,38 @@ final class ConverterServerClient {
 
     /// キーイベントはタイムアウトで捨てず、1件ずつ順番に Server へ送る。
     /// XPC が一時的に切断した場合も先頭イベントを保持して再接続後に再送する。
+    ///
+    /// Server が再起動した後に開き直したセッションは既定の設定と入力言語で始まる。キーがセッションを
+    /// 開く場合は、その時点の設定と入力言語を `activationForNewSession` から載せる。
     func sendKeyEvent(
         _ request: ConverterKeyEventRequest,
+        activationForNewSession: @escaping () -> ConverterSessionActivation?,
         completion: @escaping (ConverterServerResponse?) -> Void
     ) {
-        enqueue({ _ in .handleKeyEvent(request) }, retriesOnFailure: true, completion: completion)
+        var carriedActivation = false
+        enqueue({ [weak self] _ in
+            var request = request
+            if request.activation == nil, let self, self.sessionID == nil || self.sessionNeedsActivation {
+                request.activation = activationForNewSession()
+            }
+            carriedActivation = request.activation != nil
+            return .handleKeyEvent(request)
+        }, retriesOnFailure: true, completion: { [weak self] response in
+            // 再送のたびに組み立て直すので、届いたと分かってから下ろす
+            if response != nil, carriedActivation {
+                self?.sessionNeedsActivation = false
+            }
+            completion(response)
+        })
+    }
+
+    /// 待っている命令をすべて破棄する（応答は nil で完了する）。入力先が変わったときと、
+    /// Server が応答しないときに、古いキーを後から Server へ再生しないために使う。
+    func cancelPendingCommands() {
+        guard commandQueue.count > 0 else { return }
+        InputTrace.event(.transport, controller: self.inputTraceID, reason: .cancelled, number: commandQueue.count)
+        cancelGeneration &+= 1
+        commandQueue.cancelAll(finishingWith: nil)
     }
 
     func sendIfSessionOpen(
@@ -216,7 +249,6 @@ final class ConverterServerClient {
         reopenMissingSession: Bool = false,
         completion: @escaping (ConverterServerResponse?) -> Void
     ) {
-        var proposedSessionID: String?
         var traceRequestID: UInt64 = 0
         var activeAttemptID: UUID?
         commandQueue.enqueue(
@@ -233,6 +265,7 @@ final class ConverterServerClient {
                 }
                 let attemptID = UUID()
                 activeAttemptID = attemptID
+                let cancelGeneration = self.cancelGeneration
                 let reconnectDelay = self.nextReconnectAttemptDate.timeIntervalSinceNow
                 if self.shouldAttemptReconnect, reconnectDelay > 0 {
                     InputTrace.event(.transport, controller: self.inputTraceID, request: traceRequestID, reason: .reconnectWait)
@@ -243,8 +276,10 @@ final class ConverterServerClient {
                     }
                     return
                 }
-                let sessionID = self.sessionID ?? proposedSessionID ?? UUID().uuidString
-                proposedSessionID = sessionID
+                let sessionID = self.sessionID ?? self.proposedSessionID ?? UUID().uuidString
+                if self.sessionID == nil {
+                    self.proposedSessionID = sessionID
+                }
                 let sessionCommand = commandBuilder(sessionID)
                 traceRequestID = InputTrace.requestID(sessionCommand)
                 let command: ConverterServerCommand = if self.sessionID == nil {
@@ -253,7 +288,9 @@ final class ConverterServerClient {
                     .session(sessionID: sessionID, command: sessionCommand)
                 }
                 self.sendResolved(command, reopenMissingSession: reopenMissingSession,
-                                  isCurrent: { activeAttemptID == attemptID }) { [weak self] response in
+                                  isCurrent: { [weak self] in
+                                      activeAttemptID == attemptID && self?.cancelGeneration == cancelGeneration
+                                  }) { [weak self] response in
                     activeAttemptID = nil
                     guard let self else {
                         finish(.finish(nil))
@@ -385,6 +422,36 @@ final class ConverterServerClient {
         }
     }
 
+    /// Server が命令を処理できる状態かを、打鍵用とは別の使い捨ての接続で確かめる。
+    /// ping は変換と同じ実行系を通るため、応答があれば次のキーも処理できる。
+    static func probeServer(timeout: TimeInterval, completion: @escaping @MainActor (Bool) -> Void) {
+        final class Outcome { var reported = false }
+        let outcome = Outcome()
+        let connection = NSXPCConnection(machServiceName: ConverterServerXPC.machServiceName, options: [])
+        connection.remoteObjectInterface = NSXPCInterface(with: ConverterServerXPCProtocol.self)
+        connection.resume()
+        let report: @MainActor (Bool) -> Void = { alive in
+            guard !outcome.reported else { return }
+            outcome.reported = true
+            connection.invalidate()
+            completion(alive)
+        }
+        let proxy = connection.remoteObjectProxyWithErrorHandler { _ in
+            DispatchQueue.main.async { report(false) }
+        } as? ConverterServerXPCProtocol
+        guard let proxy else {
+            report(false)
+            return
+        }
+        proxy.ping("input-ready") { reply in
+            // この2つは Server が変換と同じ実行系で返す。そのまま送り返すだけの古い Server の応答は、
+            // キーを処理できる証拠にならない。準備に失敗した Server もキーには応答できる。
+            let answered = reply == "ConverterServer: input-ready-v1" || reply == "ConverterServer: input-unavailable"
+            DispatchQueue.main.async { report(answered) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { report(false) }
+    }
+
     private func ensureConnection() -> NSXPCConnection {
         if let connection {
             return connection
@@ -438,6 +505,8 @@ final class ConverterServerClient {
 
     private func acceptOpenedSession(_ sessionID: String) {
         self.sessionID = sessionID
+        proposedSessionID = nil
+        sessionNeedsActivation = true
         hasOpenedSession = true
         shouldAttemptReconnect = false
         nextReconnectAttemptDate = .distantPast

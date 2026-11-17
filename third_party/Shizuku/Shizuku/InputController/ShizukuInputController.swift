@@ -35,6 +35,15 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
     private var nextKeyEventID: UInt64 = 0
     private var activationGeneration: UInt64 = 0
     private var pendingConverterServerActivation: ConverterSessionActivation?
+    /// 応答待ちのキーが進まない時間を数える。上限を超えたら待つのをやめる（`releaseStalledKeys`）
+    private var pendingKeyWatch = PendingKeyWatch(limit: 3)
+    private var keyStallWorkItem: DispatchWorkItem?
+    /// 応答待ちのキーを破棄した。Server 側に残ったかもしれない入力中の文字を、次のキーで捨てさせる
+    private var needsCompositionReset = false
+    /// 待つのをやめた時刻。直後の Enter は、反応がない間に押した続きとして扱う
+    private var stallReleasedAt: TimeInterval?
+    private static let launchUptime = ProcessInfo.processInfo.systemUptime
+    private static var firstKeyResponseRecorded = false
     var liveConversionEnabled: Bool {
         Config.LiveConversion().value
     }
@@ -450,6 +459,15 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         self.cachedCursorRect = nil
         self.activationGeneration &+= 1
         self.pendingConverterServerActivation = nil
+        if self.pendingKeyEventCount > 0 {
+            // この欄で打ったキーを、離れた後で Server へ再生しない。先頭のキーは処理済みかも
+            // しれないので、次にこのコントローラで打つ最初のキーで入力中の文字を捨てさせる。
+            self.converterServerClient.cancelPendingCommands()
+            self.needsCompositionReset = true
+        }
+        self.keyStallWorkItem?.cancel()
+        self.keyStallWorkItem = nil
+        self.pendingKeyWatch.reset()
         self.converterServerClient.sendIfSessionOpen({ _ in .lifecycle(.deactivate) }, completion: { _ in })
         self.currentConverterView = nil
         self.hasClientMarkedText = false
@@ -470,6 +488,15 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         InputTrace.event(.commitComposition, controller: self.inputTraceID, state: InputTrace.State(self.inputState))
         if self.placedAssistance != nil, let client = sender as? IMKTextInput {
             self.commitPlacedAssistance(client: client, afterKeyCallback: false)
+            return
+        }
+        if self.needsCompositionReset {
+            // 応答待ちのキーを破棄した後は、表示中の文字を本体が確定済み。Server に残った入力中の
+            // 文字を確定させると同じ文字がもう一度入るので、挿入させずに捨てさせる。
+            // 次のキーに載せる reset は、この命令が届かなかった場合のために残す。
+            if !ConverterServerAvailability.shared.isUnavailable {
+                self.converterServerClient.sendIfSessionOpen({ _ in .composition(.stopComposition) }, completion: { _ in })
+            }
             return
         }
         let activationGeneration = self.activationGeneration
@@ -701,6 +728,22 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         optionDirectInputText: String? = nil,
         assistanceAll: Bool = false
     ) -> Bool {
+        if ConverterServerAvailability.shared.isUnavailable {
+            // Server が応答しない間は consume しない。打ったキーが表示されないまま溜まり、
+            // Enter や削除まで効かなくなるより、そのままアプリへ渡す。
+            if self.pendingKeyEventCount > 0 || self.inputState != .none || self.hasClientMarkedText {
+                self.releaseStalledKeys()
+            }
+            ConverterServerAvailability.shared.noteKeyWhileUnavailable()
+            self.traceGuard(.serverUnavailable)
+            // 反応がない間に繰り返し押した Enter が、入力中の文字を確定した直後に届くと、
+            // チャット欄では書きかけの文がそのまま送信される。確定の直後だけは受け取って捨てる。
+            if event.keyCode == 36 || event.keyCode == 76, let released = self.stallReleasedAt,
+               ProcessInfo.processInfo.systemUptime - released < 1 {
+                return true
+            }
+            return false
+        }
         let disposition = ConverterClientEventRouter.disposition(
             event: event,
             context: .init(
@@ -721,6 +764,8 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         // Reserve ownership now so a rapid following key cannot fall through while
         // the context query and Server dispatch are still queued on the main thread.
         self.pendingKeyEventCount += 1
+        self.pendingKeyWatch.keyQueued(at: ProcessInfo.processInfo.systemUptime)
+        self.scheduleKeyStallCheck()
         self.nextKeyEventID &+= 1
         let eventID = self.nextKeyEventID
         let generation = self.activationGeneration
@@ -728,13 +773,13 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.activationGeneration == generation else {
-                self.pendingKeyEventCount = max(0, self.pendingKeyEventCount - 1)
+                self.finishPendingKey(answered: false)
                 self.traceGuard(.staleActivation, request: eventID)
                 return
             }
             self.finishActivationSetup()
             guard self.activationGeneration == generation else {
-                self.pendingKeyEventCount = max(0, self.pendingKeyEventCount - 1)
+                self.finishPendingKey(answered: false)
                 self.traceGuard(.staleActivation, request: eventID)
                 return
             }
@@ -764,7 +809,7 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         }
         // A remote getter can reenter IMK. Never send the old field's key afterward.
         guard self.activationGeneration == generation else {
-            self.pendingKeyEventCount = max(0, self.pendingKeyEventCount - 1)
+            self.finishPendingKey(answered: false)
             self.traceGuard(.staleActivation, request: eventID)
             return
         }
@@ -772,6 +817,13 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
         self.hideCompletionDisplay()
 
         let scene = self.makeSceneObservation()
+        var activation = self.pendingConverterServerActivation
+        if self.needsCompositionReset {
+            self.needsCompositionReset = false
+            var reset = activation ?? self.currentConverterServerActivation()
+            reset.resetComposition = true
+            activation = reset
+        }
         let request = ConverterKeyEventRequest(
             eventID: eventID,
             event: event,
@@ -785,24 +837,33 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
             typeBackSlash: Config.TypeBackSlash().value,
             optionDirectInputText: optionDirectInputText,
             context: textContext,
-            activation: self.pendingConverterServerActivation,
+            activation: activation,
             scene: scene
         )
         self.pendingConverterServerActivation = nil
         let activationGeneration = self.activationGeneration
         let traceID = self.inputTraceID
         InputTrace.event(.queued, controller: traceID, request: request.eventID)
-        self.converterServerClient.sendKeyEvent(request) { [weak self] response in
+        self.converterServerClient.sendKeyEvent(request, activationForNewSession: { [weak self] in
+            // Server が再起動した後の最初のキー。既定値ではなく、今の設定と入力言語で始めさせる
+            guard let self else { return nil }
+            return self.currentConverterServerActivation()
+        }, completion: { [weak self] response in
             InputTrace.reply(response, controller: traceID, request: request.eventID)
             Task { @MainActor in
                 guard let self else {
                     InputTrace.event(.guardReturn, controller: traceID, request: request.eventID, reason: .ownerReleased)
                     return
                 }
-                self.pendingKeyEventCount = max(0, self.pendingKeyEventCount - 1)
+                self.finishPendingKey(answered: response != nil)
                 guard self.activationGeneration == activationGeneration else {
                     self.traceGuard(.staleActivation, request: request.eventID)
                     return
+                }
+                if response != nil, !Self.firstKeyResponseRecorded {
+                    Self.firstKeyResponseRecorded = true
+                    InputTrace.persistent(.firstKey, controller: traceID,
+                                          milliseconds: Int((ProcessInfo.processInfo.systemUptime - Self.launchUptime) * 1000))
                 }
                 guard let response else {
                     self.traceGuard(.noResponse, request: request.eventID)
@@ -851,7 +912,7 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
                     )
                 }
             }
-        }
+        })
     }
 
     /// Menu callbacks must never ask the active application's synchronous proxy.
@@ -894,6 +955,92 @@ class ShizukuInputController: IMKInputController, NSMenuItemValidation {
             ),
             enableSuggestion: Config.AIBackendPreference().value != .off
         )
+    }
+
+    @MainActor private func currentConverterServerActivation() -> ConverterSessionActivation {
+        ConverterSessionActivation(config: self.converterServerSessionConfig, inputLanguage: self.inputLanguage)
+    }
+
+    /// 応答待ちのキーを 1 件精算する。`answered` は Server の応答が届いたとき
+    @MainActor private func finishPendingKey(answered: Bool) {
+        self.pendingKeyEventCount = max(0, self.pendingKeyEventCount - 1)
+        if self.pendingKeyEventCount == 0 {
+            self.pendingKeyWatch.reset()
+            self.keyStallWorkItem?.cancel()
+            self.keyStallWorkItem = nil
+        } else if answered {
+            self.pendingKeyWatch.keyAnswered(at: ProcessInfo.processInfo.systemUptime, stillPending: true)
+        }
+    }
+
+    @MainActor private func scheduleKeyStallCheck(confirming: Bool = false) {
+        guard self.keyStallWorkItem == nil,
+              let remaining = self.pendingKeyWatch.remaining(at: ProcessInfo.processInfo.systemUptime) else { return }
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.keyStallWorkItem = nil
+                self.checkKeyStall(confirming: confirming)
+            }
+        }
+        self.keyStallWorkItem = item
+        // 上限を超えた後は、少し置いてもう一度確かめる。メインスレッドが塞がっていただけなら、
+        // その間に溜まっていた応答が先に処理されて時計が進む。
+        DispatchQueue.main.asyncAfter(deadline: .now() + (confirming ? 0.15 : max(remaining, 0.05)), execute: item)
+    }
+
+    @MainActor private func checkKeyStall(confirming: Bool) {
+        guard self.pendingKeyEventCount > 0 else {
+            self.pendingKeyWatch.reset()
+            return
+        }
+        guard self.pendingKeyWatch.isStalled(at: ProcessInfo.processInfo.systemUptime) else {
+            self.scheduleKeyStallCheck()
+            return
+        }
+        guard confirming else {
+            self.scheduleKeyStallCheck(confirming: true)
+            return
+        }
+        self.releaseStalledKeys()
+        ConverterServerAvailability.shared.markUnavailable()
+    }
+
+    /// Server が応答しないまま上限を超えた。待っているキーを破棄し、表示中の入力中の文字を
+    /// そのまま確定して、何も入力していない状態へ戻す。破棄したキーは後から再生しない。
+    @MainActor private func releaseStalledKeys() {
+        let now = ProcessInfo.processInfo.systemUptime
+        InputTrace.persistent(.keyStall, controller: self.inputTraceID,
+                              milliseconds: Int(self.pendingKeyWatch.waited(at: now) * 1000), number: self.pendingKeyEventCount)
+        self.keyStallWorkItem?.cancel()
+        self.keyStallWorkItem = nil
+        self.pendingKeyWatch.reset()
+        // まだ送り出していないキーと、これから届く応答を無効にする
+        self.activationGeneration &+= 1
+        self.converterServerClient.cancelPendingCommands()
+        self.needsCompositionReset = true
+        self.stallReleasedAt = now
+        self.placedAssistance = nil; self.assistanceUndo = nil
+        self.placedPresentationVersion &+= 1; self.placedPresentationPending = false
+        if self.hasClientMarkedText, !self.clientMarkedString.isEmpty, let client = self.client() {
+            // 待っている間にアプリが自分で確定していれば（クリックなど）、入力中の範囲はもうない。
+            // そのときに挿入すると同じ文字が二重に入る。
+            let marked = client.markedRange()
+            if marked.location != NSNotFound, marked.length > 0 {
+                self.insertClientText(self.clientMarkedString, replacementRange: NSRange(location: NSNotFound, length: 0), client: client)
+            }
+        }
+        self.hasClientMarkedText = false
+        self.currentConverterView = nil
+        self.inputState = .none
+        self.endThinking()
+        self.candidatesUI.loaded?.window.orderOut(nil)
+        self.predictionUI.loaded?.window.orderOut(nil)
+        self.replaceSuggestionsUI.loaded?.window.orderOut(nil)
+        self.hideCompletionDisplay()
+        self.idleCompletionWorkItem?.cancel()
+        self.idleCompletion = nil
+        self.candidatesUI.loaded?.controller.updateCandidatePresentations([], selectionIndex: nil, cursorLocation: .zero)
     }
 
     @MainActor

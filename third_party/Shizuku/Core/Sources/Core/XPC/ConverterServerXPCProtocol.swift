@@ -398,10 +398,14 @@ public struct ConverterTextContext: Codable, Sendable, Equatable {
 public struct ConverterSessionActivation: Codable, Sendable, Equatable {
     public var config: ConverterSessionConfig
     public var inputLanguage: InputLanguage
+    /// Client が応答待ちのキーを破棄した後の最初のキーで true にする。Server は、破棄されたキーで
+    /// 進んだかもしれない入力中の文字を捨ててからこのキーを処理する。省略時は何もしない。
+    public var resetComposition: Bool?
 
-    public init(config: ConverterSessionConfig, inputLanguage: InputLanguage) {
+    public init(config: ConverterSessionConfig, inputLanguage: InputLanguage, resetComposition: Bool? = nil) {
         self.config = config
         self.inputLanguage = inputLanguage
+        self.resetComposition = resetComposition
     }
 }
 

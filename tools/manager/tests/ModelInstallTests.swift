@@ -39,6 +39,21 @@ enum ModelInstallTests {
         try require(manifest.selectedModels(Set(manifest.models.map(\.name))).count == 2, "CLI default keeps all models")
         print("PASS: required selection, CLI defaults and byte total")
 
+        let tiers = try JSONDecoder().decode(Manifest.self, from: Data("""
+        {"version":"tiers","models":[
+          {"name":"small","title":"S","detail":"","bytes":2000,"recommendedMemoryGB":8},
+          {"name":"middle","title":"M","detail":"","bytes":5000,"recommendedMemoryGB":16},
+          {"name":"large","title":"L","detail":"","bytes":20000,"recommendedMemoryGB":64},
+          {"name":"base","title":"B","detail":"","bytes":100,"recommendedMemoryGB":999,"required":true}
+        ]}
+        """.utf8))
+        try require(tiers.recommendedModelNames(memoryGB: 64, freeBytes: 1_000_000, reserveBytes: 1000) == ["small", "middle", "large", "base"], "all fit")
+        try require(tiers.recommendedModelNames(memoryGB: 8, freeBytes: 1_000_000, reserveBytes: 1000) == ["small", "base"], "memory limits selection")
+        try require(tiers.recommendedModelNames(memoryGB: 64, freeBytes: 9000, reserveBytes: 1000) == ["small", "middle", "base"], "largest model dropped first")
+        try require(tiers.recommendedModelNames(memoryGB: 64, freeBytes: 4000, reserveBytes: 1000) == ["small", "base"], "drops until it fits")
+        try require(tiers.recommendedModelNames(memoryGB: 64, freeBytes: 500, reserveBytes: 1000) == ["base"], "required model is kept")
+        print("PASS: recommendation follows memory and free space")
+
         let payload = work.appendingPathComponent(".payload")
         let source = payload.appendingPathComponent("models/\(required)")
         try fm.createDirectory(at: source.appendingPathComponent("embedder.mlmodelc"), withIntermediateDirectories: true)
